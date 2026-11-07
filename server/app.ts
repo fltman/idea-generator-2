@@ -50,6 +50,28 @@ async function readJson(req: IncomingMessage): Promise<any> {
   }
 }
 
+/**
+ * Only the app's own page may change state. A page on another site can make the
+ * browser POST here (loopback is no protection against the user's own browser),
+ * and could repoint a provider URL to itself to collect the API keys, or move the
+ * projects folder. Browsers send Origin on every request that is not GET/HEAD,
+ * so an Origin that is not this server is refused; a request without Origin comes
+ * from a non-browser client such as a shell script or the tests. Bodies must be
+ * JSON: a cross-site form or fetch can only send text/plain without a CORS preflight.
+ */
+function guardMutation(req: IncomingMessage) {
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD') return;
+  const origin = req.headers.origin;
+  if (origin !== undefined) {
+    let host: string | null = null;
+    try { host = new URL(origin).host; } catch { /* "null" or malformed: not us */ }
+    if (!host || host !== req.headers.host) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
+  }
+  if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
+    throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
+}
+
 function send(res: ServerResponse, status: number, body: unknown, type = 'application/json; charset=utf-8') {
   const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
@@ -328,6 +350,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
       }
+      guardMutation(req);
       const ev = url.pathname.match(/^\/api\/boards\/(\d+)\/events$/);
       if (ev && req.method === 'GET') return events(+ev[1], req, res);
       for (const [method, re, fn] of routes) {
