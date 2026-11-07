@@ -6,6 +6,7 @@
 // localStorage and are pushed to the server, which keeps them in memory only.
 // Environment variables are a fallback for keys.
 
+import { isAbsolute } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 
 export type ProviderId = 'openrouter' | 'anthropic' | 'openai' | 'azure' | 'ollama' | 'mlx' | 'lmstudio' | 'custom';
@@ -79,7 +80,9 @@ export function mergeAppSettings(raw: any): AppSettings {
     if (typeof raw?.baseUrls?.[p] === 'string') out.baseUrls[p] = s(raw.baseUrls[p]).replace(/\/+$/, '');
   }
   for (const r of ROLES) if (s(raw?.models?.[r], 200)) out.models[r] = s(raw.models[r], 200);
-  if (/^(~\/|\/)/.test(s(raw?.projectsRoot))) out.projectsRoot = s(raw.projectsRoot);
+  // Absolute on this platform (/srv/ideas, E:\ideas) or under the home folder (~/ideas); a relative path is refused.
+  const root = s(raw?.projectsRoot);
+  if (/^~\//.test(root) || isAbsolute(root)) out.projectsRoot = root;
   const max = Number(raw?.maxUsdPerDay);
   if (Number.isFinite(max) && max >= 0) out.maxUsdPerDay = Math.min(1000, max);
   return out;

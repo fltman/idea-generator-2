@@ -53,6 +53,9 @@ test('settings from the browser are merged onto defaults, junk dropped', () => {
   assert.equal(s.models.judge, 'ollama:qwen3:8b');
   assert.equal(s.models.expand, DEFAULT_APP_SETTINGS.models.expand);
   assert.equal(s.projectsRoot, DEFAULT_APP_SETTINGS.projectsRoot, 'a relative path is refused');
+  assert.equal(mergeAppSettings({ projectsRoot: '/srv/ideas' }).projectsRoot, '/srv/ideas');
+  assert.equal(mergeAppSettings({ projectsRoot: '~/ideas' }).projectsRoot, '~/ideas');
+  if (process.platform === 'win32') assert.equal(mergeAppSettings({ projectsRoot: 'E:\\ideas' }).projectsRoot, 'E:\\ideas', 'a Windows drive path is absolute');
   assert.equal(s.maxUsdPerDay, DEFAULT_APP_SETTINGS.maxUsdPerDay);
 });
 

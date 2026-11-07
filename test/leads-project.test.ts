@@ -65,6 +65,6 @@ test('project folders never overwrite: a taken name gets -2', async () => {
   const b = await writeProject({ root, brief, idea, goal: '', lineage: [], lang: 'en', gitInit: false });
   assert.deepEqual([a, b].map((p) => p.slice(root.length + 1)), ['bank', 'bank-2']);
   assert.deepEqual(readdirSync(a).sort(), ['.gitignore', 'CLAUDE.md', 'README.md', 'idea.json', 'vault']);
-  assert.match(readFileSync(join(a, 'README.md'), 'utf8'), new RegExp(`cd "${a}"\\nclaude`));
+  assert.ok(readFileSync(join(a, 'README.md'), 'utf8').includes(`cd "${a}"\nclaude`), 'the README starts Claude in the folder');
   await assert.rejects(writeProject({ root: 'relative', brief, idea, goal: '', lineage: [], lang: 'en', gitInit: false }), /absolute/);
 });

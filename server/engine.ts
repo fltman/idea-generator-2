@@ -45,6 +45,12 @@ export function createBus() {
   };
 }
 
+/** Show a folder in the desktop's file manager: Finder, Explorer or the freedesktop default. */
+function revealInFileManager(path: string) {
+  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
+  execFile(cmd, [path], () => {});
+}
+
 /** Arc of n children pointing away from where the parent came from. */
 export function arcPositions(parent: Idea, grandparent: Idea | null, n: number) {
   const dir = grandparent ? Math.atan2(parent.y - grandparent.y, parent.x - grandparent.x) : Math.random() * Math.PI * 2;
@@ -77,7 +83,7 @@ export function createEngine(deps: Deps) {
   const { repo } = deps;
   const fetchPage = deps.fetchPage ?? realFetchPage;
   const fetchPapers = deps.fetchPapers ?? realFetchPapers;
-  const reveal = deps.reveal ?? ((p: string) => execFile('open', [p], () => {}));
+  const reveal = deps.reveal ?? revealInFileManager;
   const llm = makeLLM(deps.chat);
   const bus = createBus();
   const judging = new Set<number>();
