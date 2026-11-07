@@ -10,7 +10,6 @@ vault/
 # Demo video work files (large; not for the repo)
 demo/
 
-# graft's local graph cache — regenerable, not committed (run `graft build`).
-/graft/
-# Code index cache (graft)
+# graft code index: its graph cache and the ripgrep config it writes at the root. Regenerable with `graft build`.
 graft/
+.ignore
