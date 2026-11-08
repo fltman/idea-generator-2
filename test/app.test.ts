@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, createHandler } from '../server/app.ts';
+import { allowedHosts, createHandler, hostKey, originKey } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -67,9 +67,9 @@ test('a page on another site cannot change settings or boards; the app itself an
 });
 
 // fetch() will not let us lie about Host, so this goes through node:http directly.
-function withHost(port: number, host: string, method = 'GET', path = '/api/boards', body?: string) {
+function withHost(port: number, host: string, method = 'GET', path = '/api/boards', body?: string, extra: Record<string, string> = {}) {
   return new Promise<{ status: number; code?: string }>((done, fail) => {
-    const headers: Record<string, string> = { Host: host };
+    const headers: Record<string, string> = { Host: host, ...extra };
     if (body) headers['Content-Type'] = 'application/json';
     const r = request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
       let raw = '';
@@ -105,8 +105,8 @@ test('DNS rebinding: only our own host names are answered, on our port', async (
   // HOST set at start-up is accepted too, and only on our port; IPv6 literals get brackets.
   assert.ok(allowedHosts(8300, 'Ideas.LAN').has('ideas.lan:8300'));
   assert.ok(allowedHosts(8300, 'fe80::1').has('[fe80::1]:8300'));
-  assert.ok(allowedHosts(80).has('localhost'), 'port 80 is left out of Host by browsers');
-  assert.ok(!allowedHosts(8300).has('localhost'));
+  assert.ok(allowedHosts(80).has(hostKey('localhost')!), 'port 80 is left out of Host by browsers');
+  assert.ok(!allowedHosts(8300).has(hostKey('localhost')!));
   const lan = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), host: 'Ideas.LAN' }));
   await new Promise<void>((r) => lan.listen(0, '127.0.0.1', r));
   try {
@@ -118,4 +118,32 @@ test('DNS rebinding: only our own host names are answered, on our port', async (
   } finally {
     lan.close();
   }
+});
+
+test('Host and Origin are compared in one normal form', async () => {
+  // Case, default ports and IPv6 spelling all fold to the same key.
+  assert.equal(hostKey('LocalHost:8300'), 'localhost:8300');
+  assert.equal(hostKey('localhost'), 'localhost:80');
+  assert.equal(hostKey('localhost:80'), 'localhost:80');
+  assert.equal(hostKey('[0:0:0:0:0:0:0:1]:8300'), '[::1]:8300');
+  assert.equal(originKey('http://LOCALHOST:8300'), 'localhost:8300');
+  assert.equal(originKey('http://localhost:80'), 'localhost:80');
+  assert.equal(originKey('http://localhost'), hostKey('localhost:80'));
+  assert.equal(originKey('https://localhost'), 'localhost:443');
+  // Not a host, not an origin.
+  for (const h of [undefined, '', 'evil.example/path', 'user@localhost:8300', 'localhost:8300?x', 'local host'])
+    assert.equal(hostKey(h), null, String(h));
+  for (const o of [undefined, 'null', 'file:///etc', 'not a url'])
+    assert.equal(originKey(o), null, String(o));
+
+  // End to end: an upper-case Host with the matching Origin passes both guards.
+  const port = (server.address() as any).port;
+  const json = { 'Content-Type': 'application/json' };
+  const ok = await withHost(port, `LOCALHOST:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://LocalHost:${port}` });
+  assert.equal(ok.status, 200, 'same host, different case');
+  const ipv6 = await withHost(port, `[0:0:0:0:0:0:0:1]:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://[::1]:${port}` });
+  assert.equal(ipv6.status, 200, 'same IPv6 address, spelled two ways');
+  const other = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://127.0.0.1:${port}` });
+  assert.equal(other.status, 403, 'another of our names is still another origin');
+  assert.equal(other.code, 'bad_origin');
 });

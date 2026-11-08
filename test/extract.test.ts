@@ -45,9 +45,11 @@ test('caps very long pages', () => {
 });
 
 test('links to this machine, the LAN and link-local are refused, also after a redirect', async () => {
-  for (const a of ['127.0.0.1', '127.8.8.8', '10.0.0.5', '172.31.9.9', '192.168.1.1', '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', '::', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip'])
+  for (const a of ['127.0.0.1', '127.8.8.8', '10.0.0.5', '172.31.9.9', '192.168.1.1', '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', '::', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip',
+                   '64:ff9b::a9fe:a9fe', '64:ff9b::808:808', '::a9fe:a9fe', '::10.0.0.1', '::127.0.0.1', 'fec0::1', 'feff::1', '2002:c0a8:101::1', '2002:808:808::1'])
     assert.ok(isPrivateAddress(a), `${a} is private`);
-  for (const a of ['93.184.216.34', '8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:8.8.8.8'])
+  for (const a of ['93.184.216.34', '8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:8.8.8.8',
+                   '2001:4860:4860::8888', '64:ff9c::1', '2003::1', '::1:0:0:1'])
     assert.ok(!isPrivateAddress(a), `${a} is public`);
 
   // Names resolve through an injected lookup: no network in the tests.
@@ -71,7 +73,8 @@ test('links to this machine, the LAN and link-local are refused, also after a re
   const refused = /private or local/;
 
   for (const u of ['http://127.0.0.1:8300/api/boards', 'http://localhost/', 'http://a.localhost/', 'http://[::1]/', 'http://169.254.169.254/latest/meta-data',
-                   'http://10.1.2.3/', 'http://192.168.1.1/admin', 'http://[fe80::1]/', 'http://intranet.example/', 'http://rebind.example/'])
+                   'http://10.1.2.3/', 'http://192.168.1.1/admin', 'http://[fe80::1]/', 'http://intranet.example/', 'http://rebind.example/',
+                   'http://[64:ff9b::a9fe:a9fe]/latest/meta-data', 'http://[::a9fe:a9fe]/', 'http://[fec0::1]/', 'http://[2002:a9fe:a9fe::1]/'])
     await assert.rejects(read(u), refused, u);
   await assert.rejects(read('ftp://example.com/'), /http/);
   await assert.rejects(read('https://nowhere.example/'), /resolve/);

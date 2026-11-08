@@ -18,7 +18,13 @@ for (const [net, bits] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
   ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
-for (const [net, bits] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
+// IPv6: ::/96 is unspecified, loopback and the old IPv4-compatible form (::10.0.0.1);
+// 64:ff9b::/96 is NAT64, which a DNS64 network translates to the embedded IPv4
+// (64:ff9b::a9fe:a9fe reaches 169.254.169.254); 2002::/16 is 6to4, also embedding
+// IPv4; fec0::/10 is the retired site-local range; then unique-local, link-local, multicast.
+for (const [net, bits] of [
+  ['::', 96], ['64:ff9b::', 96], ['2002::', 16], ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
+] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
 
 /** True for loopback, LAN, link-local, multicast and unroutable addresses, and for anything that is not an IP. */
 export function isPrivateAddress(address: string): boolean {

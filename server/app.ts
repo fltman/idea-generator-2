@@ -61,21 +61,51 @@ async function readJson(req: IncomingMessage): Promise<any> {
  * and can read every answer. Refusing any Host but our own names closes that.
  */
 export function allowedHosts(port: number, host?: string) {
-  const names = new Set(['localhost', '127.0.0.1', '[::1]']);
-  const extra = host?.trim().toLowerCase();
-  if (extra) names.add(extra.includes(':') && !extra.startsWith('[') ? `[${extra}]` : extra);
+  const names = ['localhost', '127.0.0.1', '[::1]'];
+  const extra = host?.trim();
+  if (extra) names.push(extra.includes(':') && !extra.startsWith('[') ? `[${extra}]` : extra);
   const out = new Set<string>();
   for (const n of names) {
-    out.add(`${n}:${port}`);
-    if (port === 80) out.add(n); // a browser leaves the default port out of Host
+    const key = hostKey(`${n}:${port}`);
+    if (key) out.add(key);
   }
   return out;
 }
 
+/**
+ * The one form both guards compare: "hostname:port", lowercased, IPv6 in brackets
+ * and compressed, the port always written (80 or 443 when the sender left it out).
+ * The URL parser does the work, so LOCALHOST:80, localhost and localhost:80 agree.
+ */
+const keyOf = (u: URL) => `${u.hostname}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+
+/** A Host header in normal form, or null if it is not a bare host[:port]. */
+export function hostKey(header: string | undefined): string | null {
+  if (!header) return null;
+  try {
+    const u = new URL(`http://${header}`);
+    if (u.username || u.password || u.pathname !== '/' || u.search || u.hash || u.host === '') return null;
+    return keyOf(u);
+  } catch {
+    return null;
+  }
+}
+
+/** An Origin header in normal form, or null for "null", other schemes and junk. */
+export function originKey(origin: string | undefined): string | null {
+  if (!origin) return null;
+  try {
+    const u = new URL(origin);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? keyOf(u) : null;
+  } catch {
+    return null;
+  }
+}
+
 function guardHost(req: IncomingMessage, host?: string) {
   const port = req.socket.localPort;
-  const sent = (req.headers.host ?? '').toLowerCase();
-  if (!port || !allowedHosts(port, host).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
+  const sent = hostKey(req.headers.host);
+  if (!port || !sent || !allowedHosts(port, host).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
 }
 
 /**
@@ -92,9 +122,8 @@ function guardMutation(req: IncomingMessage) {
   if (method === 'GET' || method === 'HEAD') return;
   const origin = req.headers.origin;
   if (origin !== undefined) {
-    let host: string | null = null;
-    try { host = new URL(origin).host; } catch { /* "null" or malformed: not us */ }
-    if (!host || host !== req.headers.host) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
+    const from = originKey(origin); // null for "null" or junk: not us
+    if (!from || from !== hostKey(req.headers.host)) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
   }
   if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
     throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
