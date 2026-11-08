@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, createHandler, hostKey, hostsByPort, originKey } from '../server/app.ts';
+import { allowedHosts, createHandler, hostGuard, hostKey, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -148,13 +148,89 @@ test('Host and Origin are compared in one normal form', async () => {
   assert.equal(other.code, 'bad_origin');
 });
 
-test('the allowed Host set is built once per port, then reused', () => {
-  const allowed = hostsByPort('Ideas.LAN');
-  const a = allowed(8300);
-  assert.equal(allowed(8300), a, 'the same set, not a rebuilt one');
-  assert.deepEqual([...a].sort(), [...allowedHosts(8300, 'Ideas.LAN')].sort());
-  const b = allowed(9000);
-  assert.notEqual(b, a);
-  assert.ok(b.has('ideas.lan:9000') && !b.has('ideas.lan:8300'), 'each port gets its own names');
-  assert.equal(allowed(9000), b);
+test('the loopback and HOST names are built once per port, then reused', () => {
+  let builds = 0;
+  const interfaces = () => { builds++; return {}; };
+  // A named HOST never needs the interfaces; a wildcard looks them up once per port while hosts match.
+  const named = hostGuard({ host: 'Ideas.LAN', interfaces });
+  assert.ok(named(8300, 'ideas.lan:8300') && named(8300, 'localhost:8300') && named(9000, 'ideas.lan:9000'));
+  assert.ok(!named(8300, 'ideas.lan:9000'), 'each port gets its own names');
+  assert.equal(builds, 0);
+  const any = hostGuard({ host: '0.0.0.0', interfaces });
+  for (let n = 0; n < 5; n++) assert.ok(any(8300, 'localhost:8300'));
+  assert.equal(builds, 1, 'built on the first request, reused after');
+});
+// A machine with a LAN address and a link-local IPv6 address, which can change while we run.
+function fakeInterfaces(addresses: string[]) {
+  return () => ({
+    lo: [{ address: '127.0.0.1', family: 'IPv4' }, { address: '::1', family: 'IPv6' }],
+    eth0: addresses.map((address) => ({ address, family: address.includes(':') ? 'IPv6' : 'IPv4' })),
+  }) as any;
+}
+
+test('HOST=0.0.0.0 or :: answers to this machine\'s interface addresses, and notices new ones', () => {
+  for (const w of ['0.0.0.0', '::', '[::]', '0:0:0:0:0:0:0:0']) assert.ok(isWildcard(w), w);
+  for (const n of ['127.0.0.1', '::1', 'ideas.lan', '10.0.0.0']) assert.ok(!isWildcard(n), n);
+
+  const addresses = ['192.168.1.20', 'fe80::1%eth0'];
+  const isOurs = hostGuard({ host: '0.0.0.0', interfaces: fakeInterfaces(addresses) });
+  assert.ok(isOurs(8300, '192.168.1.20:8300'), 'the LAN address');
+  assert.ok(isOurs(8300, hostKey('[fe80::1]:8300')!), 'link-local IPv6, zone id dropped');
+  assert.ok(isOurs(8300, 'localhost:8300'), 'loopback names still work');
+  assert.ok(!isOurs(8300, '192.168.1.21:8300'), 'another machine on the LAN');
+  assert.ok(!isOurs(8300, '192.168.1.20:9000'), 'our address on another port');
+  assert.ok(!isOurs(8300, 'evil.example:8300'), 'a rebound name is still refused');
+  assert.ok(!isOurs(8300, '0.0.0.0:8300'), 'the wildcard is a bind, not an address');
+
+  addresses.push('10.8.0.2'); // a VPN came up after start
+  assert.ok(isOurs(8300, '10.8.0.2:8300'), 'looked up again before refusing');
+
+  const v6 = hostGuard({ host: '::', interfaces: fakeInterfaces(['192.168.1.20']) });
+  assert.ok(v6(8300, '192.168.1.20:8300'), ':: accepts IPv4 interface addresses too');
+  const named = hostGuard({ host: '127.0.0.1', interfaces: fakeInterfaces(['192.168.1.20']) });
+  assert.ok(!named(8300, '192.168.1.20:8300'), 'a concrete HOST does not open the interfaces');
+});
+
+test('ALLOWED_HOSTS: a bare name on any port, name:port on that port only', () => {
+  const p = parseAllowedHosts(' localhost, Ideas.Example.com:443 ,::1 [fe80::2]:9000 192.168.1.20');
+  assert.deepEqual([...p.names].sort(), ['192.168.1.20', '[::1]', 'localhost']);
+  assert.deepEqual([...p.keys].sort(), ['[fe80::2]:9000', 'ideas.example.com:443']);
+  assert.deepEqual(parseAllowedHosts(undefined), { names: new Set(), keys: new Set() });
+  for (const bad of ['evil/path', 'user@host', 'a b:x'])
+    assert.throws(() => parseAllowedHosts(bad), /ALLOWED_HOSTS/, bad);
+
+  const isOurs = hostGuard({ allowedHostList: 'localhost, ideas.example.com:443' });
+  assert.ok(isOurs(8300, 'localhost:9000'), 'a port forward: browser on 9000, server on 8300');
+  assert.ok(isOurs(8300, 'localhost:80'));
+  assert.ok(isOurs(8300, 'ideas.example.com:443'), 'a proxy in front');
+  assert.ok(!isOurs(8300, 'ideas.example.com:8443'), 'name:port is that port only');
+  assert.ok(!isOurs(8300, '127.0.0.1:9000'), 'only the names listed get any port');
+  assert.ok(!isOurs(8300, 'evil.example:9000'));
+  assert.ok(isOurs(8300, '127.0.0.1:8300'), 'the usual names still work on our port');
+});
+
+test('end to end: a port-forwarded browser and a LAN device both get the app', async () => {
+  const start = async (opts: object) => {
+    const s = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), ...opts }));
+    await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+    return { s, port: (s.address() as any).port as number };
+  };
+  const forwarded = await start({ allowedHostList: 'localhost' });
+  const lan = await start({ host: '0.0.0.0', interfaces: fakeInterfaces(['192.168.1.20']) });
+  try {
+    const json = { 'Content-Type': 'application/json' };
+    // ssh -L 9000:localhost:<port>: the browser says localhost:9000 in both Host and Origin.
+    assert.equal((await withHost(forwarded.port, 'localhost:9000', 'GET', '/')).status, 200, 'the page');
+    assert.equal((await withHost(forwarded.port, 'localhost:9000', 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: 'http://localhost:9000' })).status, 200, 'a write');
+    assert.equal((await withHost(forwarded.port, 'evil.example:9000')).status, 403);
+
+    // A tablet on the LAN opening http://192.168.1.20:<port>.
+    const host = `192.168.1.20:${lan.port}`;
+    assert.equal((await withHost(lan.port, host, 'GET', '/')).status, 200, 'the page');
+    assert.equal((await withHost(lan.port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://${host}` })).status, 200, 'a write');
+    assert.equal((await withHost(lan.port, `192.168.1.99:${lan.port}`)).status, 403);
+  } finally {
+    forwarded.s.close();
+    lan.s.close();
+  }
 });

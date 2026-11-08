@@ -5,6 +5,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
+import { isIP } from 'node:net';
+import { networkInterfaces } from 'node:os';
 import type { Repo, Idea, Board } from './db.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
@@ -20,8 +22,15 @@ export type Runtime = {
 
 type Deps = {
   repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string;
-  /** The HOST the server was started with, accepted as a Host header besides the loopback names. */
+  /**
+   * The HOST the server was started with, accepted as a Host header besides the
+   * loopback names. A wildcard bind (0.0.0.0, ::) means this machine's interface addresses.
+   */
   host?: string;
+  /** ALLOWED_HOSTS: names accepted on any port (behind a port forward or proxy), or name:port for one port. */
+  allowedHostList?: string;
+  /** Interface lister, os.networkInterfaces unless a test passes its own. */
+  interfaces?: () => ReturnType<typeof networkInterfaces>;
 };
 
 const TYPES: Record<string, string> = {
@@ -60,10 +69,12 @@ async function readJson(req: IncomingMessage): Promise<any> {
  * the attacker's page and this server as one origin, sends Host: evil.example,
  * and can read every answer. Refusing any Host but our own names closes that.
  */
-export function allowedHosts(port: number, host?: string) {
+export function allowedHosts(port: number, host?: string, interfaces: () => ReturnType<typeof networkInterfaces> = networkInterfaces) {
   const names = ['localhost', '127.0.0.1', '[::1]'];
+  const add = (n: string) => names.push(n.includes(':') && !n.startsWith('[') ? `[${n}]` : n);
   const extra = host?.trim();
-  if (extra) names.push(extra.includes(':') && !extra.startsWith('[') ? `[${extra}]` : extra);
+  if (extra && isWildcard(extra)) for (const address of interfaceAddresses(interfaces)) add(address);
+  else if (extra) add(extra);
   const out = new Set<string>();
   for (const n of names) {
     const key = hostKey(`${n}:${port}`);
@@ -102,20 +113,66 @@ export function originKey(origin: string | undefined): string | null {
   }
 }
 
-/** allowedHosts() for each port this handler is reached on, built the first time that port is seen. */
-export function hostsByPort(host?: string) {
+/** 0.0.0.0, ::, [::] and other spellings of "every address": a bind, not a name anyone browses to. */
+export function isWildcard(host: string) {
+  const bare = host.trim().replace(/^\[|\]$/g, '');
+  return isIP(bare) !== 0 && /^[0:.]+$/.test(bare);
+}
+
+/** Every address on this machine's interfaces, without IPv6 zone ids (a URL cannot carry them). */
+export function interfaceAddresses(interfaces: () => ReturnType<typeof networkInterfaces> = networkInterfaces) {
+  const out: string[] = [];
+  for (const list of Object.values(interfaces())) for (const i of list ?? []) out.push(i.address.split('%')[0]);
+  return out;
+}
+
+const hostnameOfKey = (key: string) => key.slice(0, key.lastIndexOf(':'));
+
+/**
+ * ALLOWED_HOSTS, comma or space separated. A bare name (localhost, ideas.example.com,
+ * 192.168.1.20, ::1) is accepted on any port, for a port forward or a proxy whose
+ * public port is not ours; name:port is accepted on that port only. A malformed
+ * entry stops the server at start-up rather than silently refusing every request.
+ */
+export function parseAllowedHosts(list: string | undefined) {
+  const names = new Set<string>();
+  const keys = new Set<string>();
+  for (const raw of (list ?? '').split(/[\s,]+/).filter(Boolean)) {
+    const entry = raw.includes(':') && !raw.startsWith('[') && isIP(raw) === 6 ? `[${raw}]` : raw;
+    const key = hostKey(entry);
+    if (!key) throw new Error(`ALLOWED_HOSTS: "${raw}" is not a host name`);
+    if (/:\d+$/.test(entry)) keys.add(key);
+    else names.add(hostnameOfKey(key));
+  }
+  return { names, keys };
+}
+
+/**
+ * Decides whether a Host (in hostKey form) is ours, for a request that came in on `port`.
+ * The loopback and HOST names are built once per port. On a wildcard bind the
+ * interface addresses are looked up again before refusing, since DHCP, Wi-Fi and
+ * VPNs change them while the server runs.
+ */
+export function hostGuard(opts: { host?: string; allowedHostList?: string; interfaces?: () => ReturnType<typeof networkInterfaces> } = {}) {
+  const extra = parseAllowedHosts(opts.allowedHostList);
+  const wildcard = !!opts.host && isWildcard(opts.host);
   const cache = new Map<number, Set<string>>();
-  return (port: number) => {
-    let set = cache.get(port);
-    if (!set) cache.set(port, (set = allowedHosts(port, host)));
+  const build = (port: number) => {
+    const set = allowedHosts(port, opts.host, opts.interfaces);
+    cache.set(port, set);
     return set;
+  };
+  return (port: number, sent: string): boolean => {
+    if (extra.keys.has(sent) || extra.names.has(hostnameOfKey(sent))) return true;
+    if ((cache.get(port) ?? build(port)).has(sent)) return true;
+    return wildcard && build(port).has(sent);
   };
 }
 
-function guardHost(req: IncomingMessage, allowed: (port: number) => Set<string>) {
+function guardHost(req: IncomingMessage, isOurs: (port: number, sent: string) => boolean) {
   const port = req.socket.localPort;
   const sent = hostKey(req.headers.host);
-  if (!port || !sent || !allowed(port).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
+  if (!port || !sent || !isOurs(port, sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
 }
 
 /**
@@ -251,9 +308,9 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir, host }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, publicDir, host, allowedHostList, interfaces }: Deps) {
   const root = resolve(publicDir);
-  const allowed = hostsByPort(host);
+  const isOurs = hostGuard({ host, allowedHostList, interfaces });
 
   function providerStatus() {
     const s = runtime.get();
@@ -414,7 +471,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
-      guardHost(req, allowed); // every request, reads too: a rebound page could read boards and settings
+      guardHost(req, isOurs); // every request, reads too: a rebound page could read boards and settings
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
