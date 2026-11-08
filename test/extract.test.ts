@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { asUrl, createDispatcher, decodeEntities, fetchPage, guardedLookup, htmlToText, isPrivateAddress, lookupOnce } from '../server/extract.ts';
+import { asUrl, createDispatcher, decodeEntities, embeddedIPv4, fetchPage, guardedLookup, htmlToText, isPrivateAddress, lookupOnce } from '../server/extract.ts';
 import { createServer, type Server } from 'node:http';
 import { fetch as undiciFetch } from 'undici';
 
@@ -46,15 +46,25 @@ test('caps very long pages', () => {
   assert.ok(text.endsWith('[…]'));
 });
 
+test('NAT64 and 6to4 addresses are judged by the IPv4 they embed, so DNS64 networks still reach the web', () => {
+  for (const [a, v4] of [['64:ff9b::808:808', '8.8.8.8'], ['64:ff9b::8.8.8.8', '8.8.8.8'], ['64:ff9b::a9fe:a9fe', '169.254.169.254'],
+                         ['2002:808:808::1', '8.8.8.8'], ['2002:c0a8:101:5::9', '192.168.1.1'], ['2003::1', null], ['8.8.8.8', null]] as const)
+    assert.equal(embeddedIPv4(a), v4, a);
+  for (const a of ['64:ff9b::808:808', '64:ff9b::5db8:d822', '64:ff9b::8.8.8.8', '2002:808:808::1', '2002:5db8:d822:1::1'])
+    assert.ok(!isPrivateAddress(a), `${a} is public`);
+  for (const a of ['64:ff9b::a9fe:a9fe', '64:ff9b::7f00:1', '64:ff9b::10.0.0.1', '64:ff9b::c000:201', '2002:c0a8:101::1', '2002:7f00:1::1', '2002::1', '64:ff9b:1::808:808'])
+    assert.ok(isPrivateAddress(a), `${a} is private`);
+});
+
 test('links to this machine, the LAN and link-local are refused, also after a redirect', async () => {
   for (const a of ['127.0.0.1', '127.8.8.8', '10.0.0.5', '172.31.9.9', '192.168.1.1', '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', '::', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip',
-                   '64:ff9b::a9fe:a9fe', '64:ff9b::808:808', '::a9fe:a9fe', '::10.0.0.1', '::127.0.0.1', 'fec0::1', 'feff::1', '2002:c0a8:101::1', '2002:808:808::1',
+                   '64:ff9b::a9fe:a9fe', '::a9fe:a9fe', '::10.0.0.1', '::127.0.0.1', 'fec0::1', 'feff::1', '2002:c0a8:101::1',
                    '64:ff9b:1::a9fe:a9fe', '64:ff9b:1:ffff::1', '::ffff:0:a9fe:a9fe', '::ffff:0:7f00:1', '::ffff:7f00:1', '::ffff:a9fe:a9fe',
                    '2001:0:4136:e378:8000:63bf:3fff:fdd2', '2001::1', '2001:0:ffff:ffff:ffff:ffff:ffff:ffff', '2001:db8::1', '2001:db8:ffff::1',
                    '192.0.2.1', '198.51.100.7', '203.0.113.9', '192.88.99.1'])
     assert.ok(isPrivateAddress(a), `${a} is private`);
   for (const a of ['93.184.216.34', '8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:8.8.8.8',
-                   '2001:4860:4860::8888', '64:ff9c::1', '2003::1', '::1:0:0:1', '64:ff9b:2::1', '::ffff:1:0:1', '::ffff:808:808',
+                   '2001:4860:4860::8888', '64:ff9b::808:808', '2002:808:808::1', '64:ff9c::1', '2003::1', '::1:0:0:1', '64:ff9b:2::1', '::ffff:1:0:1', '::ffff:808:808',
                    '2001:1::1:0:0:1', '2001:4860::1', '2001:db7:ffff::1', '2001:db9::1', '192.0.3.1', '198.51.101.1', '203.0.114.1', '192.88.100.1'])
     assert.ok(!isPrivateAddress(a), `${a} is public`);
 

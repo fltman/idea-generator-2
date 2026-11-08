@@ -26,22 +26,57 @@ for (const [net, bits] of [
   ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
 // IPv6: ::/96 is unspecified, loopback and the old IPv4-compatible form (::10.0.0.1);
-// 64:ff9b::/96 and the local-use 64:ff9b:1::/48 are NAT64, which a DNS64 network
-// translates to the embedded IPv4 (64:ff9b::a9fe:a9fe reaches 169.254.169.254);
-// ::ffff:0:0:0/96 is the SIIT IPv4-translated form; 2002::/16 is 6to4 and 2001::/32 is
-// Teredo, both tunnels that embed IPv4; 2001:db8::/32 is for documentation;
-// fec0::/10 is the retired site-local range; then unique-local, link-local, multicast.
-// IPv4-mapped addresses (::ffff:a.b.c.d, which URL writes as ::ffff:7f00:1) need no
-// rule of their own: BlockList checks them against the IPv4 subnets above.
+// the local-use NAT64 prefix 64:ff9b:1::/48 has no fixed IPv4 position, so all of it
+// is refused; ::ffff:0:0:0/96 is the SIIT IPv4-translated form; 2001::/32 is Teredo,
+// whose embedded IPv4 is the obfuscated client, not the destination; 2001:db8::/32 is
+// for documentation; fec0::/10 is the retired site-local range; then unique-local,
+// link-local, multicast. IPv4-mapped addresses (::ffff:a.b.c.d, which URL writes as
+// ::ffff:7f00:1) need no rule of their own: BlockList checks them against the IPv4
+// subnets above. NAT64 (64:ff9b::/96) and 6to4 (2002::/16) are judged by the IPv4
+// they embed, see embeddedIPv4().
 for (const [net, bits] of [
-  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2001::', 32], ['2001:db8::', 32],
-  ['2002::', 16], ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b:1::', 48], ['2001::', 32], ['2001:db8::', 32],
+  ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
+
+/** An IPv6 address as its eight 16-bit groups; accepts :: and a dotted IPv4 tail. */
+function ipv6Groups(address: string): number[] {
+  let text = address.toLowerCase().split('%')[0];
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted[2].split('.').map(Number);
+    text = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.includes('::') ? text.split('::') : [text, undefined];
+  const parse = (part: string | undefined) => (part ? part.split(':').map((g) => parseInt(g, 16)) : []);
+  const left = parse(head);
+  const right = parse(tail);
+  return tail === undefined ? left : [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+/**
+ * The IPv4 address a NAT64 (64:ff9b::/96, RFC 6052) or 6to4 (2002::/16, RFC 3056)
+ * address stands for, or null. On an IPv6-only network with DNS64 every public site
+ * resolves to 64:ff9b::<its IPv4>, so refusing the whole prefix would refuse the web;
+ * the embedded IPv4 is what the packet reaches (64:ff9b::a9fe:a9fe is 169.254.169.254).
+ */
+export function embeddedIPv4(address: string): string | null {
+  if (isIP(address) !== 6) return null;
+  const g = ipv6Groups(address);
+  let hi: number, lo: number;
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((x) => x === 0)) [hi, lo] = [g[6], g[7]];
+  else if (g[0] === 0x2002) [hi, lo] = [g[1], g[2]];
+  else return null;
+  return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.');
+}
 
 /** True for loopback, LAN, link-local, multicast and unroutable addresses, and for anything that is not an IP. */
 export function isPrivateAddress(address: string): boolean {
   const family = isIP(address);
-  return family === 0 || PRIVATE.check(address, family === 4 ? 'ipv4' : 'ipv6');
+  if (family === 0) return true;
+  const v4 = embeddedIPv4(address);
+  if (v4) return PRIVATE.check(v4, 'ipv4');
+  return PRIVATE.check(address, family === 4 ? 'ipv4' : 'ipv6');
 }
 
 export type Lookup = (hostname: string) => Promise<string[]>;
