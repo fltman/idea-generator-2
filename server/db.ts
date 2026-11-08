@@ -468,32 +468,35 @@ export function openDb(file: string) {
      * a per-day count series for the last `days`.
      */
     dashboard(days = 30, limit = 40) {
-      const since = `-${days} days`;
-      const before = `-${days * 2} days`;
+      // Days are local, like spend and the dollar limits: an idea made just after
+      // local midnight counts on the new day, wherever UTC's date line falls.
+      // "Recent" is the shown days, from local midnight of the first one; "previous"
+      // is the same number of whole local days before that.
+      const dayList = localDays(days);
+      const first = localMidnight(dayList[0]);
+      const since = sqlUtc(first);
+      const before = sqlUtc(new Date(first.getFullYear(), first.getMonth(), first.getDate() - days));
       const rows = db
         .prepare(
           `SELECT k.keyword,
              COUNT(*) AS count,
              COUNT(DISTINCT i.board_id) AS boards,
              AVG(i.originality + i.feasibility + i.impact) AS mean_sum,
-             SUM(i.created_at >= datetime('now', ?)) AS recent,
-             SUM(i.created_at < datetime('now', ?) AND i.created_at >= datetime('now', ?)) AS previous
+             SUM(i.created_at >= ?) AS recent,
+             SUM(i.created_at < ? AND i.created_at >= ?) AS previous
            FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
            GROUP BY k.keyword
            ORDER BY recent DESC, count DESC, k.keyword
            LIMIT ?`,
         )
         .all(since, since, before, limit) as any[];
-      // Days are local, like spend and the dollar limits: an idea made just after
-      // local midnight counts on the new day, wherever UTC's date line falls.
-      const dayList = localDays(days);
       const seriesRows = db
         .prepare(
           `SELECT k.keyword, i.created_at
            FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
            WHERE i.created_at >= ?`,
         )
-        .all(sqlUtc(localMidnight(dayList[0]))) as any[];
+        .all(since) as any[];
       const dayIndex = new Map(dayList.map((d, n) => [d, n]));
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
@@ -519,7 +522,7 @@ export function openDb(file: string) {
         .prepare(
           `SELECT (SELECT COUNT(*) FROM ideas) AS ideas, (SELECT COUNT(*) FROM boards) AS boards,
                   (SELECT COUNT(DISTINCT keyword) FROM idea_keywords) AS keywords,
-                  (SELECT COUNT(*) FROM ideas WHERE created_at >= datetime('now', ?)) AS recent`,
+                  (SELECT COUNT(*) FROM ideas WHERE created_at >= ?) AS recent`,
         )
         .get(since) as any;
       return {

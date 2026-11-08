@@ -87,3 +87,39 @@ test('local days step by calendar, across a DST change', () => {
     else process.env.TZ = tz;
   }
 });
+
+test('dashboard: recent and previous are whole local days, matching the series', () => {
+  const tz = process.env.TZ;
+  process.env.TZ = 'Pacific/Auckland';
+  try {
+    const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'windows.db');
+    const repo = openDb(file);
+    const raw = new DatabaseSync(file);
+    const board = repo.createBoard({ title: 'Fönster' });
+    const now = new Date();
+    const local = (daysAgo: number, h: number, m: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, h, m);
+    const add = (title: string, at: Date) => {
+      const idea = repo.insertIdea({ boardId: board.id, title, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+      repo.setKeywords(idea.id, ['kant']);
+      raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(at.toISOString().slice(0, 19).replace('T', ' '), idea.id);
+    };
+    // A two-day view: today and yesterday are recent, the two local days before are previous.
+    add('today, early', local(0, 0, 30));
+    add('yesterday, first minute', local(1, 0, 1));
+    add('the day before, last minute', local(2, 23, 59)); // inside a rolling 48 h window, but not one of the shown days
+    add('three days ago, first minute', local(3, 0, 1));
+    add('four days ago, last minute', local(4, 23, 59)); // older than both windows
+
+    const d = repo.dashboard(2);
+    const k = d.keywords.find((x) => x.keyword === 'kant')!;
+    assert.equal(k.count, 5);
+    assert.equal(k.recent, 2, 'today and yesterday');
+    assert.equal(k.previous, 2, 'the two local days before');
+    assert.equal(k.series.reduce((a, b) => a + b, 0), k.recent, 'recent is exactly what the series shows');
+    assert.equal(d.totals.recent, 2);
+    raw.close();
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
