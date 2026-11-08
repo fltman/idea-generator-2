@@ -478,7 +478,7 @@ export function openDb(file: string) {
       const ranges = localDayRanges(dayList);
       const since = ranges[0][0];
       const until = ranges[ranges.length - 1][1];
-      const first = localMidnight(dayList[0]);
+      const first = fromSqlUtc(since); // local midnight of the first day, already in ranges[0]
       const before = sqlUtc(new Date(first.getFullYear(), first.getMonth(), first.getDate() - days));
       const rows = db
         .prepare(
@@ -671,7 +671,7 @@ export function openDb(file: string) {
       const days = wholeDays(daysAsked); // the period, and the days the report says it covers
       // The period is whole local days, from local midnight of the first one: the
       // same days the dashboard shows and spend is booked on.
-      const firstDay = localDays(days)[0];
+      const firstDay = firstLocalDay(days);
       // Boards without listBoards()' per-board idea counts: the report counts each
       // board's ideas from its own list.
       const boards = (db.prepare(BOARDS_IN_ORDER).all() as any[]).map(boardFromRow);
@@ -764,11 +764,19 @@ export function wholeDays(days: number) {
   return Math.max(1, Math.round(days) || 1);
 }
 
-/** The last `days` local calendar days, oldest first, ending today. Calendar steps, so a DST change never skips or repeats a day. */
+/** The local day k calendar days before `now`'s: a calendar step, so a DST change never skips or repeats a day. */
+const dayBefore = (now: Date, k: number) => localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k));
+
+/** The last `days` local calendar days, oldest first, ending today. */
 export function localDays(days: number, now = new Date()) {
   const out: string[] = [];
-  for (let k = wholeDays(days) - 1; k >= 0; k--) out.push(localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k)));
+  for (let k = wholeDays(days) - 1; k >= 0; k--) out.push(dayBefore(now, k));
   return out;
+}
+
+/** The first of localDays(days), without building the others. */
+export function firstLocalDay(days: number, now = new Date()) {
+  return dayBefore(now, wholeDays(days) - 1);
 }
 
 /** The instant a local day (YYYY-MM-DD) begins. */
@@ -808,6 +816,9 @@ export function dayOf(starts: string[], at: string): number {
   }
   return found;
 }
+
+/** The instant a sqlUtc() string names. */
+const fromSqlUtc = (s: string) => new Date(`${s.replace(' ', 'T')}Z`);
 
 /** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
 const sqlUtc = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');

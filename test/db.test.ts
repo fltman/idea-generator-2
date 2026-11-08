@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { dayOf, localDay, localDayRanges, localDays, openDb, wholeDays } from '../server/db.ts';
+import { dayOf, firstLocalDay, localDay, localDayRanges, localDays, openDb, wholeDays } from '../server/db.ts';
 import { MEDAL_MIN_SUM, medal, medalFromSum } from '../public/js/score.js';
 
 test('report: medals come from score.js, so a threshold change moves the report too', () => {
@@ -243,6 +243,22 @@ test('a fractional number of days is rounded inside db.ts too: today stays in, a
   assert.equal(r.days, 3);
   assert.deepEqual(r, repo.report(3), 'report(2.5) is report(3)');
   raw.close();
+});
+
+test('firstLocalDay is the first of localDays, every day of a year that holds both DST changes', () => {
+  const tz = process.env.TZ;
+  try {
+    for (const zone of ['Europe/Stockholm', 'Pacific/Auckland']) {
+      process.env.TZ = zone;
+      for (let d = 0; d < 400; d++) {
+        const now = new Date(2026, 0, 1 + d, 12);
+        for (const days of [1, 7, 30, 365, 2.5]) assert.equal(firstLocalDay(days, now), localDays(days, now)[0], `${zone} ${localDay(now)} ${days}`);
+      }
+    }
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
 });
 
 test('dayOf: binary search over day starts, the last start at or before the instant', () => {
