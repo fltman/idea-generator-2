@@ -8,6 +8,7 @@ import { BlockList, isIP } from 'node:net';
 const MAX_BYTES = 2_000_000;
 const MAX_CHARS = 6000;
 const MAX_REDIRECTS = 5;
+const TIMEOUT_MS = 12_000;
 
 // Addresses that are never a web page we should read on a visitor's behalf: this
 // machine, the LAN, link-local (cloud metadata lives at 169.254.169.254), and the
@@ -114,34 +115,99 @@ export function htmlToText(html: string): { title: string; text: string } {
   return { title, text: text.length > MAX_CHARS ? `${text.slice(0, MAX_CHARS)}\n[…]` : text };
 }
 
+const HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
+  Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'sv,en;q=0.8',
+};
+
+/** Waits for `p`, or rejects as soon as `signal` aborts. A DNS lookup takes no signal of its own. */
+function untilAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener('abort', stop, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
+/** Drops a body we will not read, so its connection goes back to the pool now rather than at garbage collection. */
+async function discard(res: Response, signal: AbortSignal) {
+  if (res.body && !res.bodyUsed) await untilAborted(res.body.cancel().catch(() => {}), signal);
+}
+
+/** Reads at most `max` bytes, then cancels the stream so the rest is never downloaded. */
+async function readCapped(body: ReadableStream<Uint8Array> | null, max: number, signal: AbortSignal): Promise<Uint8Array> {
+  if (!body) return new Uint8Array(0);
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (size < max) {
+      const { done, value } = await untilAborted(reader.read(), signal);
+      if (done) break;
+      const room = max - size;
+      const part = value.byteLength > room ? value.subarray(0, room) : value;
+      chunks.push(part);
+      size += part.byteLength;
+    }
+  } finally {
+    reader.cancel().catch(() => {}); // past the cap, or out of time: stop the download either way
+  }
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
+
 export async function fetchPage(
-  url: string, deps: { fetch?: typeof fetch; lookup?: Lookup } = {},
+  url: string, deps: { fetch?: typeof fetch; lookup?: Lookup; timeoutMs?: number } = {},
 ): Promise<{ title: string; text: string }> {
-  const doFetch = deps.fetch ?? fetch;
-  let current = new URL(url);
-  let res: Response;
+  const ms = deps.timeoutMs ?? TIMEOUT_MS;
+  // One deadline for the whole read: every DNS lookup, every redirect hop and the body.
+  // A plain timer rather than AbortSignal.timeout(), whose timer is unref'd: it is
+  // cleared as soon as the read ends, and it keeps a waiting process alive meanwhile.
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(new DOMException('Deadline passed', 'TimeoutError')), ms);
+  const { signal } = deadline;
+  try {
+    return await readPage(new URL(url), deps.fetch ?? fetch, deps.lookup ?? realLookup, signal);
+  } catch (e) {
+    if (signal.aborted) throw new Error(`No answer within ${ms / 1000} s`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readPage(start: URL, doFetch: typeof fetch, lookup: Lookup, signal: AbortSignal) {
+  const timedLookup: Lookup = (host) => untilAborted(lookup(host), signal);
+  let current = start;
   // Redirects are followed by hand so that every hop gets the same host check.
   for (let hop = 0; ; hop++) {
-    await assertPublicUrl(current, deps.lookup);
-    res = await doFetch(current, {
-      redirect: 'manual',
-      signal: AbortSignal.timeout(12_000),
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'sv,en;q=0.8',
-      },
-    });
+    await assertPublicUrl(current, timedLookup);
+    const res = await untilAborted(doFetch(current, { redirect: 'manual', signal, headers: HEADERS }), signal);
     const location = res.headers.get('location');
-    if (!(res.status >= 300 && res.status < 400 && location)) break;
-    if (hop >= MAX_REDIRECTS) throw new Error('Too many redirects');
-    current = new URL(location, current);
+    if (res.status >= 300 && res.status < 400 && location) {
+      await discard(res, signal);
+      if (hop >= MAX_REDIRECTS) throw new Error('Too many redirects');
+      current = new URL(location, current);
+      continue;
+    }
+    if (!res.ok) {
+      await discard(res, signal);
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const type = res.headers.get('content-type') ?? '';
+    if (!/html|text\/plain/i.test(type)) {
+      await discard(res, signal);
+      throw new Error(`Not a web page (${type || 'unknown type'})`);
+    }
+    const html = new TextDecoder('utf-8').decode(await readCapped(res.body, MAX_BYTES, signal));
+    return /text\/plain/i.test(type) ? { title: '', text: html.slice(0, MAX_CHARS) } : htmlToText(html);
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const type = res.headers.get('content-type') ?? '';
-  if (!/html|text\/plain/i.test(type)) throw new Error(`Not a web page (${type || 'unknown type'})`);
-  const buf = await res.arrayBuffer();
-  const html = new TextDecoder('utf-8').decode(buf.byteLength > MAX_BYTES ? buf.slice(0, MAX_BYTES) : buf);
-  return /text\/plain/i.test(type) ? { title: '', text: html.slice(0, MAX_CHARS) } : htmlToText(html);
 }

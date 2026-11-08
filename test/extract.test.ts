@@ -88,3 +88,94 @@ test('links to this machine, the LAN and link-local are refused, also after a re
   assert.equal((await read('https://www.example.com/')).title, 'Direct');
   await assert.rejects(read('https://example.com/loop'), /redirects/);
 });
+
+// ---- fetchPage limits: size, one deadline, and no body left unread.
+const publicDns = async () => ['93.184.216.34'];
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((done, fail) => {
+    const t = setTimeout(done, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(t); fail(signal.reason); }, { once: true });
+  });
+const html = { 'content-type': 'text/html' };
+/** A body that records whether it was cancelled. */
+function tracked(chunks: string[] = []) {
+  const state = { cancelled: false };
+  const enc = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    pull(c) { const next = chunks.shift(); if (next === undefined) c.close(); else c.enqueue(enc.encode(next)); },
+    cancel() { state.cancelled = true; },
+  });
+  return { body, state };
+}
+
+test('an endless page is read up to the size cap and the rest is never downloaded', { timeout: 5000 }, async () => {
+  const chunk = new TextEncoder().encode(`<p>${'ord '.repeat(16_000)}</p>`); // about 64 kB
+  let pulled = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(c) { pulled += chunk.byteLength; c.enqueue(chunk); },
+    cancel() { cancelled = true; },
+  });
+  const page = await fetchPage('https://example.com/endless', { fetch: (async () => new Response(body, { headers: html })) as typeof fetch, lookup: publicDns });
+  assert.ok(page.text.length > 0 && page.text.length <= 6000 + 4);
+  assert.ok(cancelled, 'the stream was cancelled at the cap');
+  assert.ok(pulled <= 2_000_000 + 2 * chunk.byteLength, `read ${pulled} bytes, about 2 MB at most`);
+});
+
+test('one deadline covers every hop: slow redirects add up', async () => {
+  const fake = (async (u: URL | string | Request, init?: RequestInit) => {
+    await sleep(150, init?.signal ?? undefined); // each hop alone is well inside the deadline
+    const n = Number(String(u).match(/\/(\d+)$/)?.[1] ?? 0);
+    return n < 4 ? new Response(null, { status: 302, headers: { location: `/${n + 1}` } }) : new Response('<p>end</p>', { headers: html });
+  }) as typeof fetch;
+  const t0 = Date.now();
+  await assert.rejects(fetchPage('https://example.com/0', { fetch: fake, lookup: publicDns, timeoutMs: 300 }), /No answer within 0\.3 s/);
+  assert.ok(Date.now() - t0 < 700, 'stopped at the deadline, not after every hop');
+  // The same chain with time to spare goes through.
+  assert.equal((await fetchPage('https://example.com/0', { fetch: fake, lookup: publicDns, timeoutMs: 3000 })).text, 'end');
+});
+
+test('the deadline also bounds DNS and a body that stops sending', async () => {
+  const neverAnswers = () => new Promise<string[]>(() => {});
+  let fetched = false;
+  const t0 = Date.now();
+  await assert.rejects(
+    fetchPage('https://slow-dns.example/', { fetch: (async () => { fetched = true; return new Response(''); }) as typeof fetch, lookup: neverAnswers, timeoutMs: 200 }),
+    /No answer within 0\.2 s/,
+  );
+  assert.ok(Date.now() - t0 < 600);
+  assert.equal(fetched, false);
+
+  let cancelled = false;
+  const stalled = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}), cancel() { cancelled = true; } });
+  await assert.rejects(
+    fetchPage('https://example.com/stall', { fetch: (async () => new Response(stalled, { headers: html })) as typeof fetch, lookup: publicDns, timeoutMs: 200 }),
+    /No answer/,
+  );
+  assert.ok(cancelled, 'the stalled body was cancelled');
+});
+
+test('bodies that are not read are cancelled: every redirect, an error page, a non-page', async () => {
+  const bodies: { cancelled: boolean }[] = [];
+  const fake = (async (u: URL | string | Request) => {
+    const url = String(u);
+    const make = (status: number, headers: Record<string, string>, chunks = ['<p>ignored</p>']) => {
+      const { body, state } = tracked(chunks);
+      bodies.push(state);
+      return new Response(body, { status, headers });
+    };
+    if (url.endsWith('/a')) return make(301, { location: '/b' });
+    if (url.endsWith('/b')) return make(302, { location: '/c' });
+    if (url.endsWith('/c')) return make(200, html, ['<title>C</title><p>Text</p>']);
+    if (url.endsWith('/gone')) return make(404, html);
+    return make(200, { 'content-type': 'application/pdf' });
+  }) as typeof fetch;
+  const read = (u: string) => fetchPage(u, { fetch: fake, lookup: publicDns });
+
+  assert.equal((await read('https://example.com/a')).title, 'C');
+  assert.deepEqual(bodies.map((b) => b.cancelled), [true, true, false], 'both redirect bodies cancelled; the page read to its end');
+  bodies.length = 0;
+  await assert.rejects(read('https://example.com/gone'), /HTTP 404/);
+  await assert.rejects(read('https://example.com/file.pdf'), /Not a web page/);
+  assert.deepEqual(bodies.map((b) => b.cancelled), [true, true]);
+});
