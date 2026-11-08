@@ -87,9 +87,11 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
     const globalSpent = repo.spentOn(null);
     const boards = repo.listBoards();
     // A deleted board is gone from the list: forget its state, or the map grows with every
-    // board ever made. Not while its step still runs, though: that step's result lands in it.
+    // board ever made. Also while its step still runs: that step sees it was forgotten
+    // (see mine below) and leaves no trace. The delete route forgets at once (forget());
+    // this catches a board deleted some other way.
     const alive = new Set(boards.map((b) => b.id));
-    for (const [id, s] of states) if (!alive.has(id) && !s.busy) states.delete(id);
+    for (const id of states.keys()) if (!alive.has(id)) states.delete(id);
     for (const b of boards) {
       if (b.config.mode !== 'auto') {
         // Keep the state of a board taken off auto: a step may still be running, and its
@@ -123,13 +125,20 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
       s.busy = true;
       publish(b.id, s, { state: 'running', last: s.status.last, ...counts });
       const st = s;
-      // A step can outlast the board's auto mode: the user switches it to manual (or
-      // deletes it) while the step runs. Its result still counts toward the limits, but
-      // the status it shows is manual, not a pace or backoff of an autopilot that is off.
+      // A step can outlast the board's auto mode: the user switches it to manual while
+      // the step runs. Its result still counts toward the limits, but the status it shows
+      // is manual, not a pace or backoff of an autopilot that is off.
       const stillAuto = () => repo.getBoard(b.id)?.config.mode === 'auto';
+      // Or it outlasts the board itself. Board ids are reused (INTEGER PRIMARY KEY without
+      // AUTOINCREMENT): after the newest board is deleted, the next one gets its id. A
+      // deleted board's state was dropped from the map, so a step whose state is no longer
+      // the one kept for this id belongs to a board that is gone, and must not publish to,
+      // or count toward, a new board under the same id.
+      const mine = () => states.get(b.id) === st;
       engine
         .autoStep(b.id)
         .then((r) => {
+          if (!mine()) return;
           if (r.did !== 'idle') st.steps.push(now());
           st.lastAt = now();
           st.errors = 0;
@@ -141,6 +150,7 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
           });
         })
         .catch((e: any) => {
+          if (!mine()) return;
           st.errors++;
           st.lastErrorAt = st.lastAt = now();
           const last = st.status.last;
@@ -168,6 +178,14 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
     },
     status(boardId: number): AutopilotStatus {
       return states.get(boardId)?.status ?? { state: 'manual' };
+    },
+    /**
+     * Drop a board's state now, when it is deleted. Waiting for the next tick is not
+     * enough: a board created in between can get the same id and would inherit the
+     * old board's hour of steps, errors, backoff and last result.
+     */
+    forget(boardId: number) {
+      states.delete(boardId);
     },
     /** Boards the scheduler currently keeps state for. */
     tracked(): number[] {

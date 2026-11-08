@@ -131,6 +131,68 @@ test('scheduler: a deleted board is forgotten, also while its step is still runn
   assert.deepEqual(ap2.tracked(), []);
 });
 
+test('scheduler: a new board that reuses a deleted board\'s id starts clean, even while the old step still runs', async () => {
+  for (const outcome of ['result', 'error'] as const) {
+    const repo = openDb(':memory:');
+    let now = T;
+    const { engine } = fakeEngineFor(repo);
+    const finish: Array<() => void> = [];
+    const slow = {
+      ...engine,
+      autoStep: () => new Promise<{ did: 'combine' }>((ok, fail) => {
+        finish.push(() => (outcome === 'result' ? ok({ did: 'combine' }) : fail(Object.assign(new Error('no key'), { code: 'no_key' }))));
+      }),
+    };
+    const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+    const config = { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 1, usdPerDay: 100 } };
+    const old = repo.createBoard({ title: 'Old', config });
+    const flush = () => new Promise((r) => setTimeout(r, 5));
+
+    await ap.tick();
+    assert.equal(ap.status(old.id).state, 'running', `${outcome}: the old board's step is under way`);
+
+    // Deleted mid-step, as the DELETE route does it; the next board gets the same id.
+    ap.forget(old.id);
+    repo.deleteBoard(old.id);
+    const reused = repo.createBoard({ title: 'New', config });
+    assert.equal(reused.id, old.id, 'SQLite hands out the freed id again');
+    assert.equal(ap.status(reused.id).state, 'manual', `${outcome}: no status carried over`);
+
+    const seen: any[] = [];
+    engine.bus.on(reused.id, (e: any) => seen.push(e.status));
+    finish[0](); await flush();
+    assert.deepEqual(seen, [], `${outcome}: the old step publishes nothing on the new board`);
+    assert.equal(ap.status(reused.id).state, 'manual');
+
+    // The new board runs a step of its own at once: no hour of steps (limit 1), no
+    // error backoff and no last result from the old board.
+    await ap.tick();
+    assert.equal(finish.length, 2, `${outcome}: the new board's own first step started`);
+    assert.equal(ap.status(reused.id).state, 'running');
+    assert.equal(ap.status(reused.id).last, undefined, `${outcome}: no last result from the old board`);
+    assert.equal(ap.status(reused.id).stepsLastHour, 0, `${outcome}: the old step is not in the new board's hour`);
+    finish[1](); await flush();
+  }
+});
+
+test('scheduler: a board deleted without forget() is still dropped at the next tick, busy or not', async () => {
+  const repo = openDb(':memory:');
+  const { engine } = fakeEngineFor(repo);
+  let release!: () => void;
+  const slow = { ...engine, autoStep: () => new Promise<{ did: 'combine' }>((r) => { release = () => r({ did: 'combine' }); }) };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => T });
+  const board = repo.createBoard({ title: 'B', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap.tick();
+  repo.deleteBoard(board.id);
+  await ap.tick();
+  assert.deepEqual(ap.tracked(), [], 'dropped while its step runs');
+  const seen: any[] = [];
+  engine.bus.on(board.id, (e: any) => seen.push(e));
+  release(); await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(seen, [], 'and its late result goes nowhere');
+  assert.deepEqual(ap.tracked(), []);
+});
+
 test('autoStep with the real engine: judge first, grow a small pool, then breed', async () => {
   const repo = openDb(':memory:');
   let n = 0;

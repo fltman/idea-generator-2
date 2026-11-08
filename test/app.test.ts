@@ -235,6 +235,41 @@ test('one URL parse per Host header, and one hostKeys per request for both guard
   assert.equal(await urlParses(write), 3);
 });
 
+test('a write without a body needs no Content-Type; a body still must be JSON; an unknown route is 404', async () => {
+  const port = (server.address() as any).port;
+  const raw = (path: string, headers: Record<string, string>, body?: string, chunked = false) =>
+    new Promise<{ status: number; code?: string }>((done, fail) => {
+      const r = request({ host: '127.0.0.1', port, method: 'POST', path, headers: { Host: `127.0.0.1:${port}`, ...headers } }, (res) => {
+        let text = '';
+        res.on('data', (c) => (text += c));
+        res.on('end', () => done({ status: res.statusCode!, code: (() => { try { return JSON.parse(text).code; } catch { return undefined; } })() }));
+      });
+      r.on('error', fail);
+      if (!chunked && body !== undefined && !('Content-Length' in headers)) r.setHeader('Content-Length', Buffer.byteLength(body));
+      else if (!chunked) r.removeHeader('transfer-encoding'); // no length header at all, like curl -X POST
+      if (body !== undefined) r.write(body);
+      r.end();
+    });
+
+  // No body at all, like `curl -X POST`: no Content-Length, no Content-Type.
+  const curl = await raw('/api/boards', { 'Content-Length': '0' });
+  assert.equal(curl.status, 200, 'an empty body needs no Content-Type');
+  const bare = await raw('/api/boards', {});
+  assert.equal(bare.status, 200, 'nor does a request with no length header');
+  // A streaming client may send an empty chunked body: still no body.
+  assert.equal((await raw('/api/boards', { 'Transfer-Encoding': 'chunked' }, undefined, true)).status, 200, 'an empty chunked body');
+  // A misspelled route is 404, and a bodyless call to a real route reaches the route.
+  assert.equal((await raw('/api/bords', {})).status, 404);
+  assert.equal((await raw('/api/ideas/99999/judge', {})).code, 'not_found', 'the route answered, not the Content-Type check');
+
+  // A body that is not JSON is still refused, with or without a length, before it is parsed.
+  assert.equal((await raw('/api/boards', { 'Content-Type': 'text/plain' }, '{"lang":"sv"}')).status, 415);
+  assert.equal((await raw('/api/boards', {}, '{"lang":"sv"}')).status, 415, 'no Content-Type with a body');
+  assert.equal((await raw('/api/boards', { 'Content-Type': 'text/plain', 'Transfer-Encoding': 'chunked' }, '{"lang":"sv"}', true)).status, 415, 'chunked');
+  // And a page on another site is refused before any of this, body or not.
+  assert.equal((await raw('/api/boards', { Origin: 'https://evil.example' })).code, 'bad_origin');
+});
+
 test('the loopback and HOST names are per port', () => {
   const named = hostGuard({ host: 'Ideas.LAN' });
   assert.ok(named(8300, 'ideas.lan:8300') && named(8300, 'localhost:8300') && named(9000, 'ideas.lan:9000'));

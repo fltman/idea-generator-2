@@ -49,6 +49,12 @@ const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice
 const clampDays = (v: unknown) => Math.round(Math.min(365, Math.max(1, Number(v) || 30)));
 const daysOf = (url: URL) => clampDays(url.searchParams.get('days'));
 
+/**
+ * The body of a matched route, as JSON. A body must be sent as application/json (see
+ * guardMutation); an empty one needs no Content-Type, so a script's
+ * `curl -X POST .../judge` works, and so does a client that sends an empty chunked
+ * body. This runs after routing, so a misspelled route answers 404, not 415.
+ */
 async function readJson(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -58,6 +64,8 @@ async function readJson(req: IncomingMessage): Promise<any> {
     chunks.push(c);
   }
   if (!size) return {};
+  if (!/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
+    throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
@@ -287,7 +295,8 @@ function guardHost(req: IncomingMessage, sent: string[], isOurs: (port: number, 
  * so an Origin other than the host this request was sent to is refused; a request
  * without Origin comes from a non-browser client such as a shell script or the tests.
  * Bodies must be JSON: a cross-site form or fetch can only send text/plain without a
- * CORS preflight.
+ * CORS preflight. readJson checks that once a route has matched; a request with no
+ * body needs no Content-Type.
  *
  * The Origin must be the Host header itself, not just any of our names: a bare
  * ALLOWED_HOSTS name is ours on every port, and a page from another local server
@@ -303,9 +312,8 @@ function guardMutation(req: IncomingMessage, sent: string[]) {
     const from = originKey(origin); // null for "null" or junk: not us
     if (!from || !sent.includes(from)) throw new AppError(403, 'bad_origin', badOriginMessage(origin, from, req.headers.host, sent[0] ?? null));
   }
-  if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
-    throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
 }
+
 
 function send(res: ServerResponse, status: number, body: unknown, type = 'application/json; charset=utf-8') {
   const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
@@ -488,7 +496,10 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
       if (b.config && typeof b.config === 'object') patch.config = b.config;
       return engine.updateBoard(+id, patch);
     }],
-    ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => ({ ok: repo.deleteBoard(+id) })],
+    ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => {
+      autopilot.forget(+id); // before the id can be handed to a new board
+      return { ok: repo.deleteBoard(+id) };
+    }],
     ['PUT', /^\/api\/boards\/(\d+)\/positions$/, ([id], b) => {
       if (!repo.getBoard(+id)) throw new AppError(404, 'not_found', 'Board not found');
       const positions = (Array.isArray(b.positions) ? b.positions : [])
