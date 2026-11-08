@@ -44,7 +44,10 @@ const TYPES: Record<string, string> = {
 };
 
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
-const daysOf = (url: URL) => Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 30));
+// Whole days only: localDays() steps back k days with new Date(y, m, d - k), and a
+// fractional k would truncate to yesterday and leave today out of the period.
+const clampDays = (v: unknown) => Math.round(Math.min(365, Math.max(1, Number(v) || 30)));
+const daysOf = (url: URL) => clampDays(url.searchParams.get('days'));
 
 async function readJson(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = [];
@@ -460,12 +463,12 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
     ['DELETE', /^\/api\/leads\/(\d+)$/, ([id]) => ({ ok: repo.deleteLead(+id) })],
 
     // ---- dashboard: keyword trends across all boards
-    ['GET', /^\/api\/dashboard$/, (_p, _b, url) => repo.dashboard(Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 30)))],
+    ['GET', /^\/api\/dashboard$/, (_p, _b, url) => repo.dashboard(daysOf(url))],
     ['GET', /^\/api\/keywords\/([^/]+)\/ideas$/, ([kw]) => ({ ideas: repo.ideasWithKeyword(decodeURIComponent(kw)) })],
 
     // ---- report: insights, ideas and projects across all boards
     ['GET', /^\/api\/report$/, (_p, _b, url) => repo.report(daysOf(url))],
-    ['POST', /^\/api\/report\/synthesis$/, (_p, b) => engine.synthesize(Math.min(365, Math.max(1, Number(b.days) || 30)), b.lang === 'en' ? 'en' : 'sv')],
+    ['POST', /^\/api\/report\/synthesis$/, (_p, b) => engine.synthesize(clampDays(b.days), b.lang === 'en' ? 'en' : 'sv')],
     ['GET', /^\/api\/report\.md$/, (_p, _b, url) => ({
       __raw: reportMarkdown(repo.report(daysOf(url)), url.searchParams.get('lang') === 'en' ? 'en' : 'sv'),
       type: 'text/markdown; charset=utf-8',

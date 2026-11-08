@@ -297,6 +297,14 @@ test('dashboard: keyword trends across boards, and drill-down', async () => {
   assert.equal(kw.recent, 2);
   assert.equal(kw.series.length, 7);
   assert.equal(kw.series.at(-1), 2, 'today');
+  // A fractional period rounds to whole days and still ends today.
+  const { data: half } = await api('GET', '/api/dashboard?days=1.5');
+  const kwHalf = half.keywords.find((k: any) => k.keyword === 'trend keyword');
+  assert.equal(kwHalf.series.length, 2);
+  assert.equal(kwHalf.series.at(-1), 2, 'today is in a fractional period');
+  const { data: report } = await api('GET', '/api/report?days=2.5');
+  assert.equal(report.days, 3);
+  assert.ok(report.totals.newIdeas >= 2, "today's ideas count as new");
   const { data: drill } = await api('GET', `/api/keywords/${encodeURIComponent('trend keyword')}/ideas`);
   assert.deepEqual(drill.ideas.map((i: any) => i.boardTitle).sort(), ['D1', 'D2']);
   judgeKeywords = ['public space', 'sound'];
