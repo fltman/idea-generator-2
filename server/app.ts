@@ -102,10 +102,20 @@ export function originKey(origin: string | undefined): string | null {
   }
 }
 
-function guardHost(req: IncomingMessage, host?: string) {
+/** allowedHosts() for each port this handler is reached on, built the first time that port is seen. */
+export function hostsByPort(host?: string) {
+  const cache = new Map<number, Set<string>>();
+  return (port: number) => {
+    let set = cache.get(port);
+    if (!set) cache.set(port, (set = allowedHosts(port, host)));
+    return set;
+  };
+}
+
+function guardHost(req: IncomingMessage, allowed: (port: number) => Set<string>) {
   const port = req.socket.localPort;
   const sent = hostKey(req.headers.host);
-  if (!port || !sent || !allowedHosts(port, host).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
+  if (!port || !sent || !allowed(port).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
 }
 
 /**
@@ -243,6 +253,7 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
 
 export function createHandler({ repo, engine, autopilot, runtime, publicDir, host }: Deps) {
   const root = resolve(publicDir);
+  const allowed = hostsByPort(host);
 
   function providerStatus() {
     const s = runtime.get();
@@ -403,7 +414,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
-      guardHost(req, host); // every request, reads too: a rebound page could read boards and settings
+      guardHost(req, allowed); // every request, reads too: a rebound page could read boards and settings
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);

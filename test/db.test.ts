@@ -123,3 +123,36 @@ test('dashboard: recent and previous are whole local days, matching the series',
     else process.env.TZ = tz;
   }
 });
+
+test('report: new ideas are counted over the same local days as its spend', () => {
+  const tz = process.env.TZ;
+  process.env.TZ = 'Pacific/Auckland';
+  try {
+    const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'report.db');
+    const repo = openDb(file);
+    const raw = new DatabaseSync(file);
+    const board = repo.createBoard({ title: 'Rapport' });
+    const now = new Date();
+    const local = (daysAgo: number, h: number, m: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo, h, m);
+    const add = (title: string, at: Date) => {
+      const idea = repo.insertIdea({ boardId: board.id, title, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+      raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(at.toISOString().slice(0, 19).replace('T', ' '), idea.id);
+    };
+    // A one-day report covers today from local midnight.
+    add('today, first minute', local(0, 0, 1));
+    add('yesterday, last minute', local(1, 23, 59)); // inside a rolling 24 h window for most of the day
+    add('yesterday, noon', local(1, 12, 0));
+    repo.addSpend(board.id, 0.5);
+
+    const r = repo.report(1);
+    assert.equal(r.totals.newIdeas, 1, 'only today');
+    assert.equal(r.boards[0].newIdeas, 1);
+    assert.equal(r.totals.spentUsd, 0.5, 'spend booked today, same period');
+    assert.equal(repo.report(2).totals.newIdeas, 3, 'two days: today and all of yesterday');
+    assert.equal(r.totals.newIdeas, repo.dashboard(1).totals.recent, 'the dashboard agrees for the same number of days');
+    raw.close();
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});

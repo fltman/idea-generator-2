@@ -20,17 +20,19 @@ for (const [net, bits] of [
   ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
 // IPv6: ::/96 is unspecified, loopback and the old IPv4-compatible form (::10.0.0.1);
-// 64:ff9b::/96 is NAT64, which a DNS64 network translates to the embedded IPv4
-// (64:ff9b::a9fe:a9fe reaches 169.254.169.254); 2002::/16 is 6to4, also embedding
+// 64:ff9b::/96 and the local-use 64:ff9b:1::/48 are NAT64, which a DNS64 network
+// translates to the embedded IPv4 (64:ff9b::a9fe:a9fe reaches 169.254.169.254);
+// ::ffff:0:0:0/96 is the SIIT IPv4-translated form; 2002::/16 is 6to4, also embedding
 // IPv4; fec0::/10 is the retired site-local range; then unique-local, link-local, multicast.
+// IPv4-mapped addresses (::ffff:a.b.c.d, which URL writes as ::ffff:7f00:1) need no
+// rule of their own: BlockList checks them against the IPv4 subnets above.
 for (const [net, bits] of [
-  ['::', 96], ['64:ff9b::', 96], ['2002::', 16], ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2002::', 16],
+  ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
 
 /** True for loopback, LAN, link-local, multicast and unroutable addresses, and for anything that is not an IP. */
 export function isPrivateAddress(address: string): boolean {
-  const mapped = address.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (mapped) return isPrivateAddress(mapped[1]);
   const family = isIP(address);
   return family === 0 || PRIVATE.check(address, family === 4 ? 'ipv4' : 'ipv6');
 }

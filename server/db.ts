@@ -658,29 +658,29 @@ export function openDb(file: string) {
      * every Claude Code project, and per board its goal, summary, best ideas.
      */
     report(days = 30) {
-      const since = `-${days} days`;
+      // The period is whole local days, from local midnight of the first one: the
+      // same days the dashboard shows and spend is booked on.
+      const firstDay = localDays(days)[0];
       const boards = repo.listBoards();
       const ideas = (db.prepare(`${IDEA_SELECT} ORDER BY i.id`).all() as any[]).map(ideaFromRow);
       const recentIds = new Set(
-        (db.prepare(`SELECT id FROM ideas WHERE created_at >= datetime('now', ?)`).all(since) as any[]).map((r) => r.id),
+        (db.prepare(`SELECT id FROM ideas WHERE created_at >= ?`).all(sqlUtc(localMidnight(firstDay))) as any[]).map((r) => r.id),
       );
-      // The medal is the one the rest of the app shows: score.js decides the thresholds, and a hand-set medal wins.
-      const sum = (i: Idea): number | null => scoreSum(i);
-      const medalOf = (i: Idea): number | null => medal(i);
-      const rank = (x: Idea, y: Idea) => (sum(y) ?? -1) - (sum(x) ?? -1) || y.id - x.id;
-      const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: sum(i), medal: medalOf(i), reason: i.reason, kind: i.kind });
+      // Sums and medals come from score.js, like everywhere else: it holds the thresholds, and a hand-set medal wins.
+      const rank = (x: Idea, y: Idea) => (scoreSum(y) ?? -1) - (scoreSum(x) ?? -1) || y.id - x.id;
+      const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: scoreSum(i), medal: medal(i), reason: i.reason, kind: i.kind });
       const title = new Map(boards.map((b) => [b.id, b.title]));
       const projects = ideas
         .filter((i) => i.projectPath)
         .map((i) => ({ ...brief(i), boardTitle: title.get(i.boardId) ?? '', path: i.projectPath! }));
       const medals = { gold: 0, silver: 0, bronze: 0 };
       for (const i of ideas) {
-        const m = medalOf(i);
+        const m = medal(i);
         if (m === 3) medals.gold++;
         else if (m === 2) medals.silver++;
         else if (m === 1) medals.bronze++;
       }
-      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(localDays(days)[0]);
+      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(firstDay);
       const latest: any = db.prepare('SELECT * FROM reports ORDER BY id DESC LIMIT 1').get();
       return {
         days,
@@ -699,7 +699,7 @@ export function openDb(file: string) {
           return {
             id: b.id, title: b.title, goal: b.goal, mode: b.config.mode,
             ideaCount: own.length, newIdeas: own.filter((i) => recentIds.has(i.id)).length,
-            best: own.filter((i) => sum(i) != null || i.medalOverride != null).sort(rank).slice(0, 3).map(brief),
+            best: own.filter((i) => scoreSum(i) != null || i.medalOverride != null).sort(rank).slice(0, 3).map(brief),
             summary: b.summary ? { ...b.summary, stale: b.summary.ideaCount !== own.length } : null,
             projects: projects.filter((p) => p.boardId === b.id),
           };

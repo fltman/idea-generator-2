@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, createHandler, hostKey, originKey } from '../server/app.ts';
+import { allowedHosts, createHandler, hostKey, hostsByPort, originKey } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -146,4 +146,15 @@ test('Host and Origin are compared in one normal form', async () => {
   const other = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://127.0.0.1:${port}` });
   assert.equal(other.status, 403, 'another of our names is still another origin');
   assert.equal(other.code, 'bad_origin');
+});
+
+test('the allowed Host set is built once per port, then reused', () => {
+  const allowed = hostsByPort('Ideas.LAN');
+  const a = allowed(8300);
+  assert.equal(allowed(8300), a, 'the same set, not a rebuilt one');
+  assert.deepEqual([...a].sort(), [...allowedHosts(8300, 'Ideas.LAN')].sort());
+  const b = allowed(9000);
+  assert.notEqual(b, a);
+  assert.ok(b.has('ideas.lan:9000') && !b.has('ideas.lan:8300'), 'each port gets its own names');
+  assert.equal(allowed(9000), b);
 });
