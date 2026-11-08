@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { asUrl, createDispatcher, decodeEntities, fetchPage, guardedLookup, htmlToText, isPrivateAddress } from '../server/extract.ts';
+import { asUrl, createDispatcher, decodeEntities, fetchPage, guardedLookup, htmlToText, isPrivateAddress, lookupOnce } from '../server/extract.ts';
 import { createServer, type Server } from 'node:http';
 import { fetch as undiciFetch } from 'undici';
 
@@ -239,17 +239,73 @@ test('the connection uses the lookup it was given, not a second DNS query of its
   }
 });
 
-test('DNS rebinding: a name that turns private between the check and the connection is refused', async () => {
+test('DNS rebinding: the connection goes to the very address that was checked, with no second lookup', async () => {
   const local = await localServer();
+  // A stand-in for "public": here only 127.0.0.1 (where the test server listens) is
+  // allowed, and 127.0.0.2 is refused. The name answers the allowed address first and
+  // the refused one after: a second lookup would be refused, the first answer is read.
   let calls = 0;
-  // First answer public (the check passes), then this machine: a rebinding name with TTL 0.
-  const rebinding = async () => (++calls === 1 ? ['93.184.216.34'] : ['127.0.0.1']);
+  const lookup = async () => (++calls === 1 ? ['127.0.0.1'] : ['127.0.0.2']);
+  const isRefused = (address: string) => address !== '127.0.0.1';
   try {
-    await assert.rejects(fetchPage(`http://rebind.example:${local.port}/api/runtime-settings`, { lookup: rebinding }),
-      /Refusing to read a private or local address \(rebind\.example\)/);
-    assert.equal(calls, 2, 'resolved once for the check and once for the connection');
-    assert.deepEqual(local.seen, [], 'nothing reached the local server');
+    const page = await fetchPage(`http://flip.example:${local.port}/`, { lookup, isRefused });
+    assert.equal(page.title, 'Local');
+    assert.equal(calls, 1, 'one lookup for the check and the connection');
+    assert.deepEqual(local.seen, [`flip.example:${local.port}`]);
+    // The other way round, a refused first answer stops the read before any connection.
+    calls = 0;
+    const late = async () => (++calls === 1 ? ['127.0.0.2'] : ['127.0.0.1']);
+    await assert.rejects(fetchPage(`http://flip.example:${local.port}/`, { lookup: late, isRefused }), /private or local address \(flip\.example\)/);
+    assert.equal(calls, 1);
+    assert.equal(local.seen.length, 1, 'no second request');
   } finally {
     await local.close();
   }
+});
+
+test('each host is resolved once per read, across redirect hops back and forth', async () => {
+  const seen: string[] = [];
+  const server: Server = createServer((req, res) => {
+    seen.push(`${req.headers.host}${req.url}`);
+    const port = (server.address() as any).port;
+    const go = (to: string) => { res.writeHead(302, { location: to }); res.end(); };
+    if (req.url === '/a') return go(`http://Other.example:${port}/b`);
+    if (req.url === '/b') return go(`http://app.example:${port}/c`);
+    if (req.url === '/c') return go('/d');
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<title>Slut</title><p>framme</p>');
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as any).port as number;
+  const asked: string[] = [];
+  const lookup = async (h: string) => { asked.push(h); return ['127.0.0.1']; };
+  try {
+    const page = await fetchPage(`http://app.example:${port}/a`, { lookup, isRefused: (a) => a !== '127.0.0.1' });
+    assert.equal(page.title, 'Slut');
+    assert.deepEqual(seen, [`app.example:${port}/a`, `other.example:${port}/b`, `app.example:${port}/c`, `app.example:${port}/d`]);
+    assert.deepEqual(asked, ['app.example', 'other.example'], 'app.example three hops, one lookup; other.example one');
+    // A new read is a new answer: nothing is kept between reads.
+    await fetchPage(`http://app.example:${port}/d`, { lookup, isRefused: (a) => a !== '127.0.0.1' });
+    assert.deepEqual(asked, ['app.example', 'other.example', 'app.example']);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('lookupOnce: one question per name, the same answer to everyone, failures too', async () => {
+  const asked: string[] = [];
+  let n = 0;
+  const once = lookupOnce(async (h) => {
+    asked.push(h);
+    if (h === 'gone.example') throw new Error('ENOTFOUND');
+    return [`93.184.216.${++n}`];
+  });
+  const [a, b] = await Promise.all([once('site.example'), once('site.example')]);
+  assert.deepEqual(a, ['93.184.216.1']);
+  assert.equal(a, b, 'two callers at once share one answer');
+  assert.deepEqual(await once('SITE.example'), ['93.184.216.1'], 'names are case-insensitive');
+  assert.deepEqual(await once('other.example'), ['93.184.216.2']);
+  await assert.rejects(once('gone.example'), /ENOTFOUND/);
+  await assert.rejects(once('gone.example'), /ENOTFOUND/);
+  assert.deepEqual(asked, ['site.example', 'other.example', 'gone.example']);
 });
