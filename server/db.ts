@@ -490,20 +490,29 @@ export function openDb(file: string) {
            LIMIT ?`,
         )
         .all(since, since, before, limit) as any[];
+      // The series is counted in SQLite, one row per keyword and day, and only for the
+      // keywords shown. The day boundaries come from JS: SQLite's 'localtime' reads the
+      // zone once per process, while JS follows TZ, and JS steps whole calendar days
+      // across a DST change. Day n runs from bounds[n] up to bounds[n + 1].
+      const bounds = [...dayList.map((day) => sqlUtc(localMidnight(day)))];
+      const last = localMidnight(dayList[dayList.length - 1]);
+      bounds.push(sqlUtc(new Date(last.getFullYear(), last.getMonth(), last.getDate() + 1)));
       const seriesRows = db
         .prepare(
-          `SELECT k.keyword, i.created_at
-           FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
-           WHERE i.created_at >= ?`,
+          `WITH bounds AS (SELECT CAST(key AS INTEGER) AS n, value AS start FROM json_each(?)),
+                days AS (SELECT a.n, a.start, b.start AS stop FROM bounds a JOIN bounds b ON b.n = a.n + 1)
+           SELECT k.keyword, d.n AS day, COUNT(*) AS count
+           FROM idea_keywords k
+           JOIN ideas i ON i.id = k.idea_id
+           JOIN days d ON i.created_at >= d.start AND i.created_at < d.stop
+           WHERE i.created_at >= ? AND i.created_at < ? AND k.keyword IN (SELECT value FROM json_each(?))
+           GROUP BY k.keyword, d.n`,
         )
-        .all(since) as any[];
-      const dayIndex = new Map(dayList.map((d, n) => [d, n]));
+        .all(JSON.stringify(bounds), since, bounds[bounds.length - 1], JSON.stringify(rows.map((r) => r.keyword))) as any[];
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
-        const at = dayIndex.get(localDay(fromSqlUtc(r.created_at)));
-        if (at === undefined) continue;
         if (!series.has(r.keyword)) series.set(r.keyword, dayList.map(() => 0));
-        series.get(r.keyword)![at]++;
+        series.get(r.keyword)![r.day] = r.count;
       }
       const boards = db
         .prepare(
@@ -755,4 +764,3 @@ function localMidnight(day: string) {
 
 /** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
 const sqlUtc = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');
-const fromSqlUtc = (s: string) => new Date(`${s.replace(' ', 'T')}Z`);

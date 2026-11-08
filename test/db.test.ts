@@ -156,3 +156,58 @@ test('report: new ideas are counted over the same local days as its spend', () =
     else process.env.TZ = tz;
   }
 });
+
+test('dashboard series: counted in SQLite on whole local days, across DST and odd offsets, for the keywords shown', () => {
+  const tz = process.env.TZ;
+  try {
+    for (const zone of ['Europe/Stockholm', 'Pacific/Auckland', 'America/St_Johns', 'Asia/Kathmandu']) {
+      process.env.TZ = zone;
+      const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'series.db');
+      const repo = openDb(file);
+      const raw = new DatabaseSync(file);
+      const board = repo.createBoard({ title: 'Serie' });
+      const now = new Date();
+      const midnight = (daysAgo: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo);
+      const stored: { keyword: string; at: string }[] = [];
+      const add = (keyword: string, at: Date) => {
+        const idea = repo.insertIdea({ boardId: board.id, title: keyword, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+        repo.setKeywords(idea.id, [keyword]);
+        const s = at.toISOString().slice(0, 19).replace('T', ' ');
+        raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(s, idea.id);
+        stored.push({ keyword, at: s });
+      };
+      // A year and a bit of ideas at pseudo-random times (both DST changes fall inside),
+      // plus the edges of many local days: the first second of a day and the last one before it.
+      let seed = 7;
+      const rand = () => ((seed = (seed * 48271) % 2147483647) / 2147483647);
+      const words = ['sol', 'vind', 'vatten', 'jord'];
+      for (let n = 0; n < 400; n++) add(words[n % 3], new Date(now.getTime() - rand() * 380 * 86_400_000));
+      for (const ago of [0, 1, 2, 30, 90, 150, 200, 250, 300, 364, 365]) {
+        add('sol', midnight(ago));
+        add('vind', new Date(midnight(ago).getTime() - 1000));
+      }
+      add('jord', midnight(1)); // a rare keyword, below the limit of three below
+
+      const days = 365;
+      const d = repo.dashboard(days, 3);
+      assert.equal(d.days.length, days);
+      assert.deepEqual(d.keywords.map((k) => k.keyword).sort(), ['sol', 'vatten', 'vind'], 'jord is not shown');
+      // The reference: each stored instant on its own local day, in JS.
+      const index = new Map(d.days.map((day, n) => [day, n]));
+      for (const k of d.keywords) {
+        const expected = d.days.map(() => 0);
+        for (const s of stored) {
+          if (s.keyword !== k.keyword) continue;
+          const at = index.get(localDay(new Date(`${s.at.replace(' ', 'T')}Z`)));
+          if (at !== undefined) expected[at]++;
+        }
+        assert.deepEqual(k.series, expected, `${zone}: ${k.keyword}`);
+        assert.equal(k.series.reduce((a, b) => a + b, 0), k.recent, `${zone}: ${k.keyword} recent matches its series`);
+      }
+      raw.close();
+    }
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
