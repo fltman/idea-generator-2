@@ -9,7 +9,7 @@ import type { Repo, Idea, Board } from './db.ts';
 import { makeLLM } from './llm.ts';
 import { asUrl, fetchPage as realFetchPage } from './extract.ts';
 import { fetchPapers as realFetchPapers, researchLeads, xLeads } from './leads.ts';
-import { writeBrief, writeProject } from './project.ts';
+import { writeBrief, writeProject as realWriteProject } from './project.ts';
 import { ProviderError, type AppSettings, type ChatFn, type Role } from './providers.ts';
 import { fitness, isJudged, medal, scoreSum } from '../public/js/score.js';
 import { nextMove } from '../public/js/evolve.js';
@@ -106,6 +106,7 @@ type Deps = {
   settings: () => AppSettings;
   fetchPage?: typeof realFetchPage;
   fetchPapers?: typeof realFetchPapers;
+  writeProject?: typeof realWriteProject;
   reveal?: (path: string) => void | Promise<void>;
   gitInit?: boolean;
 };
@@ -114,6 +115,7 @@ export function createEngine(deps: Deps) {
   const { repo } = deps;
   const fetchPage = deps.fetchPage ?? realFetchPage;
   const fetchPapers = deps.fetchPapers ?? realFetchPapers;
+  const writeProject = deps.writeProject ?? realWriteProject;
   const reveal = deps.reveal ?? revealInFileManager;
   const llm = makeLLM(deps.chat);
   const bus = createBus();
@@ -138,12 +140,21 @@ export function createEngine(deps: Deps) {
   // board is deleted, the next board created gets its id, and the same goes for ideas.
   // An operation that was waiting on the model when its board was deleted must not
   // write its result into whatever board holds that id now. Every delete of an id is
-  // counted here, and call() refuses a result that comes back after one.
+  // counted here. An operation reads the count when it starts (`since`) and passes it
+  // to call(), which refuses a result that comes back after a delete; an operation that
+  // also waits on something else (a page, the paper list, the disk) checks again with
+  // stillThere() before it goes on.
   const deletions = new Map<number, number>();
   const deletesOf = (boardId: number) => deletions.get(boardId) ?? 0;
+  const boardDeleted = (what = 'the model was working') => new AppError(409, 'board_deleted', `The board was deleted while ${what}`);
+  /** Throws board_deleted if the board was deleted since `since` (a deletesOf() reading). */
+  function stillThere(boardId: number, since: number, what?: string) {
+    if (deletesOf(boardId) !== since) throw boardDeleted(what);
+  }
 
-  async function call<T extends { costUsd: number }>(boardId: number, fn: () => Promise<T>): Promise<T> {
-    const before = deletesOf(boardId);
+  async function call<T extends { costUsd: number }>(boardId: number, fn: () => Promise<T>, since = deletesOf(boardId)): Promise<T> {
+    stillThere(boardId, since); // already gone: no model call, no cost
+    const before = since;
     let out: T;
     try {
       out = await fn();
@@ -155,7 +166,7 @@ export function createEngine(deps: Deps) {
       // The money is spent: book it to no board (0), so the global limit still sees it
       // and the board that now has this id is not charged.
       repo.addSpend(0, out.costUsd);
-      throw new AppError(409, 'board_deleted', 'The board was deleted while the model was working');
+      throw boardDeleted();
     }
     repo.addSpend(boardId, out.costUsd);
     return out;
@@ -171,15 +182,19 @@ export function createEngine(deps: Deps) {
   async function createProject(idea: Idea) {
     if (idea.projectPath && existsSync(idea.projectPath)) return { idea, path: idea.projectPath, existed: true };
     const board = mustBoard(idea.boardId);
+    const since = deletesOf(board.id);
     const lineage = repo.lineage(idea.id);
     const lang = board.config.lang;
-    const { brief } = await call(board.id, () => writeBrief({ chat: deps.chat, model: modelFor(board, 'brief'), idea, goal: board.goal, lineage, lang }));
+    const { brief } = await call(board.id, () => writeBrief({ chat: deps.chat, model: modelFor(board, 'brief'), idea, goal: board.goal, lineage, lang }), since);
     let path: string;
     try {
       path = await writeProject({ root: deps.settings().projectsRoot, brief, idea, goal: board.goal, lineage, lang, gitInit: deps.gitInit });
     } catch (e: any) {
       throw new AppError(500, 'project_failed', e?.message ?? String(e));
     }
+    // Deleted while the folder was written: the idea's id may be another board's idea
+    // now, so record nothing. The folder stays (folders are never deleted here); say where.
+    stillThere(board.id, since, `its project folder was being written; the folder is at ${path}`);
     const saved = repo.setProjectPath(idea.id, path)!;
     emitIdeas(board.id, [saved]);
     return { idea: saved, path, existed: false };
@@ -301,6 +316,7 @@ export function createEngine(deps: Deps) {
 
     async seed(boardId: number, b: { text: string; x?: number; y?: number }) {
       const board = mustBoard(boardId);
+      const since = deletesOf(board.id);
       const text = String(b.text ?? '').trim().slice(0, 20_000);
       if (!text) throw new AppError(400, 'empty', 'Write an idea or paste a link');
       const lang = board.config.lang;
@@ -316,14 +332,15 @@ export function createEngine(deps: Deps) {
         } catch (e: any) {
           throw new AppError(422, 'url_unreadable', `${url}: ${e?.message ?? e}`);
         }
+        stillThere(board.id, since, 'the link was being read');
         if (page.text.length < 80) throw new AppError(422, 'url_no_text', `${url}: too little readable text`);
         const { idea } = await call(board.id, () =>
           llm.distill({ model: modelFor(board, 'distill'), flow, board, text: [page.title, page.text].filter(Boolean).join('\n\n'), url, lang }),
-        );
+        since);
         ({ title, pitch } = idea);
         sourceUrl = url;
       } else if (text.length > 160) {
-        const { idea } = await call(board.id, () => llm.distill({ model: modelFor(board, 'distill'), flow, board, text, lang }));
+        const { idea } = await call(board.id, () => llm.distill({ model: modelFor(board, 'distill'), flow, board, text, lang }), since);
         ({ title, pitch } = idea);
       }
       const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
@@ -474,12 +491,13 @@ export function createEngine(deps: Deps) {
     // ---- leads: each board's own researchers
     async refreshLeads(boardId: number, source: 'x' | 'research') {
       const board = mustBoard(boardId);
+      const since = deletesOf(board.id);
       const lang = board.config.lang;
       const focus = board.config.researchers[source].focus;
       const topic = [board.goal, focus].filter(Boolean).join(' — ');
       let r: { leads: any[]; dropped?: number };
       if (source === 'x') {
-        r = await call(board.id, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang }));
+        r = await call(board.id, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang }), since);
       } else {
         let papers;
         try {
@@ -487,7 +505,8 @@ export function createEngine(deps: Deps) {
         } catch (e: any) {
           throw new AppError(502, 'research_failed', e?.message ?? String(e));
         }
-        r = await call(board.id, () => researchLeads({ chat: deps.chat, model: modelFor(board, 'research'), goal: topic, lang, papers }));
+        stillThere(board.id, since, 'the papers were being fetched');
+        r = await call(board.id, () => researchLeads({ chat: deps.chat, model: modelFor(board, 'research'), goal: topic, lang, papers }), since);
       }
       // Nothing verified: keep the old leads rather than wiping the panel.
       const leads = r.leads.length ? repo.replaceLeads(board.id, source, r.leads) : repo.listLeads(board.id).filter((l) => l.source === source);
