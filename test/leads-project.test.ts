@@ -42,16 +42,39 @@ test('slugs are ASCII; ~ expands to home', () => {
   assert.equal(expandHome('~\\x', 'linux'), '~\\x', 'elsewhere a backslash is part of the name');
 });
 
+type Run = (cmd: string, args: string[], options: { windowsVerbatimArguments?: boolean }, done: (e: any) => void) => void;
+const runner = (err: any, seen: string[][] = [], opts: object[] = []): Run => (cmd, args, options, done) => {
+  seen.push([cmd, ...args]);
+  opts.push(options);
+  setImmediate(() => done(err));
+};
+
+test('reveal on Windows: the path is quoted and passed verbatim, so Explorer does not split it at a comma', async () => {
+  const seen: string[][] = [];
+  const opts: object[] = [];
+  await revealInFileManager('E:\\a,b\\proj', 'win32', runner(null, seen, opts));
+  await revealInFileManager('C:\\Users\\me\\x y,z\\proj', 'win32', runner(null, seen, opts));
+  assert.deepEqual(seen, [['explorer', '"E:\\a,b\\proj"'], ['explorer', '"C:\\Users\\me\\x y,z\\proj"']]);
+  assert.deepEqual(opts, [{ windowsVerbatimArguments: true }, { windowsVerbatimArguments: true }], 'Node must not escape the quotes');
+
+  // Elsewhere the path is one argv entry as it is; commas mean nothing there.
+  const other: string[][] = [];
+  const otherOpts: object[] = [];
+  await revealInFileManager('/srv/a,b', 'linux', runner(null, other, otherOpts));
+  assert.deepEqual(other, [['xdg-open', '/srv/a,b']]);
+  assert.deepEqual(otherOpts, [{}]);
+
+  const ran: string[][] = [];
+  await assert.rejects(revealInFileManager('E:\\a"b', 'win32', runner(null, ran)), /contains a quote/);
+  assert.deepEqual(ran, [], 'a quote in the path never reaches Explorer');
+});
+
 test('reveal: a missing or failing opener is reported, Explorer\'s exit code 1 is not', async () => {
-  const runner = (err: any, seen: string[][] = []) => (cmd: string, args: string[], done: (e: any) => void) => {
-    seen.push([cmd, ...args]);
-    setImmediate(() => done(err));
-  };
   const seen: string[][] = [];
   await revealInFileManager('/p', 'linux', runner(null, seen));
   await revealInFileManager('/p', 'darwin', runner(null, seen));
   await revealInFileManager('E:\\p', 'win32', runner(Object.assign(new Error('exit 1'), { code: 1 }), seen));
-  assert.deepEqual(seen, [['xdg-open', '/p'], ['open', '/p'], ['explorer', 'E:\\p']]);
+  assert.deepEqual(seen, [['xdg-open', '/p'], ['open', '/p'], ['explorer', '"E:\\p"']]);
 
   const missing = Object.assign(new Error('spawn xdg-open ENOENT'), { code: 'ENOENT' });
   await assert.rejects(revealInFileManager('/p', 'linux', runner(missing)), /xdg-open is not installed/);

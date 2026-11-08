@@ -45,7 +45,10 @@ export function createBus() {
   };
 }
 
-type RunFile = (cmd: string, args: string[], done: (err: (Error & { code?: unknown }) | null) => void) => unknown;
+type RunFile = (
+  cmd: string, args: string[], options: { windowsVerbatimArguments?: boolean },
+  done: (err: (Error & { code?: unknown }) | null) => void,
+) => unknown;
 const REVEAL_WAIT_MS = 3000;
 
 /**
@@ -55,13 +58,21 @@ const REVEAL_WAIT_MS = 3000;
  * opener still running after a few seconds has opened something and counts as done.
  * Explorer exits with 1 even when the window opened, so on Windows only a failure to
  * start it counts.
+ *
+ * Explorer splits its command line at commas outside quotes (they separate switches
+ * like /select,), and Node quotes an argument only when it holds a space, so E:\a,b
+ * opened Documents. The path goes in quotes, passed verbatim so Node does not escape
+ * them. A Windows path cannot contain a quote; one that does is refused, so nothing
+ * can break out of the quotes.
  */
 export function revealInFileManager(path: string, platform: NodeJS.Platform = process.platform, run: RunFile = execFile as unknown as RunFile): Promise<void> {
   const cmd = platform === 'darwin' ? 'open' : platform === 'win32' ? 'explorer' : 'xdg-open';
+  const [args, options] = platform === 'win32' ? [[`"${path}"`], { windowsVerbatimArguments: true }] : [[path], {}];
+  if (platform === 'win32' && path.includes('"')) return Promise.reject(new Error('Cannot show the folder: its path contains a quote'));
   return new Promise((resolve, reject) => {
     const waited = setTimeout(resolve, REVEAL_WAIT_MS);
     waited.unref?.();
-    run(cmd, [path], (err) => {
+    run(cmd, args, options, (err) => {
       clearTimeout(waited);
       if (!err || (platform === 'win32' && typeof err.code === 'number')) return resolve();
       reject(new Error(err.code === 'ENOENT'
