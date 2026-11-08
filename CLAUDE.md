@@ -7,7 +7,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
   - Only Host headers naming this server are answered (DNS rebinding). `HOST=0.0.0.0` or `::` adds this machine's interface addresses.
   - Behind a port forward or proxy, list the names in `ALLOWED_HOSTS` (comma separated): a bare name is accepted on any port, `name:port` on that port only.
-- `npm test` – 73 tests (`node --test`), fake LLM and fake provider servers, no network
+- `npm test` – 76 tests (`node --test`), fake LLM and fake provider servers, no network
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
@@ -36,6 +36,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - **Anthropic native: send no `temperature`.** API version 2026-10-21 rejects it. Use effort `low`. The SDK sends the key as a Bearer token.
 - **OpenRouter: send `reasoning:{enabled:false}`** and retry without it on a 400 that mentions reasoning (some models insist on reasoning).
 - **X scout:** a lead is kept only if its URL is in the search engine's `url_citation` annotations. Never trust a URL the model wrote. Only OpenRouter (Grok) can search X.
+- **Links from visitors are read only through `fetchPage`** (`extract.ts`): http(s) only, private and local addresses refused on every redirect hop, and the connection resolves names through an undici dispatcher whose lookup refuses them too, so DNS rebinding cannot swap the address after the check. Never fetch such a URL with plain `fetch`.
 - **App settings live in the browser's localStorage.** The server holds them in memory, and the SSE `hello` tells the browser to push them again after a restart. Board configuration lives in the DB.
 - **Dollar limits only see providers that report cost** (OpenRouter `usage.cost`, Anthropic via the price table). A limit of 0 means free models only.
 - **Text goes into the DOM as text nodes, never `innerHTML`** (`dom.js`). Ideas are written by models and by visitors.

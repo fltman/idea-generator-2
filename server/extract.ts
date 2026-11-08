@@ -3,7 +3,9 @@
 // scripts, navigation and other chrome; keep paragraph breaks.
 
 import { lookup as dnsLookup } from 'node:dns/promises';
+import type { LookupAddress } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
+import { Agent, fetch as undiciFetch } from 'undici';
 
 const MAX_BYTES = 2_000_000;
 const MAX_CHARS = 6000;
@@ -40,11 +42,15 @@ export function isPrivateAddress(address: string): boolean {
 export type Lookup = (hostname: string) => Promise<string[]>;
 const realLookup: Lookup = async (hostname) => (await dnsLookup(hostname, { all: true })).map((a) => a.address);
 
+/** A link that leads to a private or local address, found by the check or by the connection itself. */
+export class PrivateAddressError extends Error {}
+const refusal = (name: string) => new PrivateAddressError(`Refusing to read a private or local address (${name})`);
+
 /** Throws unless the URL is http(s) to a public host; every address the name resolves to must be public. */
 export async function assertPublicUrl(url: URL, lookup: Lookup = realLookup) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error(`Only http(s) links can be read (${url.protocol})`);
   const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const refuse = () => new Error(`Refusing to read a private or local address (${url.hostname})`);
+  const refuse = () => refusal(url.hostname);
   if (host === 'localhost' || host.endsWith('.localhost')) throw refuse();
   if (isIP(host)) {
     if (isPrivateAddress(host)) throw refuse();
@@ -58,6 +64,48 @@ export async function assertPublicUrl(url: URL, lookup: Lookup = realLookup) {
   }
   if (!addresses.length || addresses.some(isPrivateAddress)) throw refuse();
 }
+
+type ConnectLookup = (
+  hostname: string,
+  options: { all?: boolean; family?: number } | number | undefined,
+  callback: (err: Error | null, address: string | LookupAddress[], family?: number) => void,
+) => void;
+
+/**
+ * The lookup the socket itself connects with (net.connect's `lookup` option).
+ * assertPublicUrl resolves a name once, and a plain fetch would resolve it again to
+ * connect: a name with a zero TTL can answer a public address to the check and
+ * 127.0.0.1 or 169.254.169.254 to the connection (DNS rebinding). Refusing private
+ * addresses here, in the answer the socket connects to, makes the address that was
+ * checked the one that is used. IP literals never reach a lookup; assertPublicUrl
+ * checks those, and they cannot change.
+ */
+export function guardedLookup(lookup: Lookup, isRefused: (address: string) => boolean = isPrivateAddress): ConnectLookup {
+  return (hostname, options, callback) => {
+    const opts = typeof options === 'object' && options ? options : { family: typeof options === 'number' ? options : 0 };
+    const notFound = () => Object.assign(new Error(`Could not resolve ${hostname}`), { code: 'ENOTFOUND' });
+    lookup(hostname).then(
+      (addresses) => {
+        if (!addresses.length) return callback(notFound(), '');
+        if (addresses.some(isRefused)) return callback(refusal(hostname), '');
+        const all = addresses.map((address) => ({ address, family: isIP(address) }));
+        const wanted = opts.family ? all.filter((a) => a.family === opts.family) : all;
+        if (!wanted.length) return callback(notFound(), '');
+        if (opts.all) callback(null, wanted);
+        else callback(null, wanted[0].address, wanted[0].family);
+      },
+      (e) => callback(e instanceof Error ? e : notFound(), ''),
+    );
+  };
+}
+
+/** An undici dispatcher whose every connection goes through guardedLookup. */
+export function createDispatcher(lookup: Lookup, isRefused?: (address: string) => boolean) {
+  return new Agent({ connect: { lookup: guardedLookup(lookup, isRefused) } });
+}
+
+/** The dispatcher for real DNS, shared so connections are pooled across reads. */
+let sharedDispatcher: Agent | undefined;
 
 /** A single URL (optionally without scheme), or null if the text is not one. */
 export function asUrl(text: string): string | null {
@@ -170,6 +218,13 @@ export async function fetchPage(
   url: string, deps: { fetch?: typeof fetch; lookup?: Lookup; timeoutMs?: number } = {},
 ): Promise<{ title: string; text: string }> {
   const ms = deps.timeoutMs ?? TIMEOUT_MS;
+  const lookup = deps.lookup ?? realLookup;
+  // undici's own fetch, not the global one: a dispatcher from the undici package
+  // is only guaranteed to work with the fetch from the same package.
+  const doFetch = deps.fetch ?? (undiciFetch as unknown as typeof fetch);
+  // The connection resolves names through the same lookup as the check, and refuses private answers.
+  const own = deps.lookup ? createDispatcher(lookup) : undefined;
+  const dispatcher = own ?? (sharedDispatcher ??= createDispatcher(realLookup));
   // One deadline for the whole read: every DNS lookup, every redirect hop and the body.
   // A plain timer rather than AbortSignal.timeout(), whose timer is unref'd: it is
   // cleared as soon as the read ends, and it keeps a waiting process alive meanwhile.
@@ -177,22 +232,26 @@ export async function fetchPage(
   const timer = setTimeout(() => deadline.abort(new DOMException('Deadline passed', 'TimeoutError')), ms);
   const { signal } = deadline;
   try {
-    return await readPage(new URL(url), deps.fetch ?? fetch, deps.lookup ?? realLookup, signal);
+    return await readPage(new URL(url), doFetch, lookup, dispatcher, signal);
   } catch (e) {
+    // fetch reports a refused connection as "fetch failed" with the reason as its cause.
+    for (let c: unknown = e; c instanceof Error; c = c.cause) if (c instanceof PrivateAddressError) throw c;
     if (signal.aborted) throw new Error(`No answer within ${ms / 1000} s`);
     throw e;
   } finally {
     clearTimeout(timer);
+    own?.destroy().catch(() => {});
   }
 }
 
-async function readPage(start: URL, doFetch: typeof fetch, lookup: Lookup, signal: AbortSignal) {
+async function readPage(start: URL, doFetch: typeof fetch, lookup: Lookup, dispatcher: Agent, signal: AbortSignal) {
   const timedLookup: Lookup = (host) => untilAborted(lookup(host), signal);
   let current = start;
   // Redirects are followed by hand so that every hop gets the same host check.
   for (let hop = 0; ; hop++) {
     await assertPublicUrl(current, timedLookup);
-    const res = await untilAborted(doFetch(current, { redirect: 'manual', signal, headers: HEADERS }), signal);
+    const init = { redirect: 'manual', signal, headers: HEADERS, dispatcher } as RequestInit;
+    const res = await untilAborted(doFetch(current, init), signal);
     const location = res.headers.get('location');
     if (res.status >= 300 && res.status < 400 && location) {
       await discard(res, signal);

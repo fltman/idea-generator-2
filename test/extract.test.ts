@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { asUrl, decodeEntities, fetchPage, htmlToText, isPrivateAddress } from '../server/extract.ts';
+import { asUrl, createDispatcher, decodeEntities, fetchPage, guardedLookup, htmlToText, isPrivateAddress } from '../server/extract.ts';
+import { createServer, type Server } from 'node:http';
+import { fetch as undiciFetch } from 'undici';
 
 test('recognises a lone link, with or without scheme', () => {
   assert.equal(asUrl('https://example.com/a?b=1'), 'https://example.com/a?b=1');
@@ -180,4 +182,70 @@ test('bodies that are not read are cancelled: every redirect, an error page, a n
   await assert.rejects(read('https://example.com/gone'), /HTTP 404/);
   await assert.rejects(read('https://example.com/file.pdf'), /Not a web page/);
   assert.deepEqual(bodies.map((b) => b.cancelled), [true, true]);
+});
+
+// ---- DNS rebinding: the address that is checked is the address that is connected to.
+/** A local HTTP server that counts the requests it gets. */
+async function localServer() {
+  const seen: string[] = [];
+  const server: Server = createServer((req, res) => {
+    seen.push(String(req.headers.host));
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<title>Local</title><p>secret</p>');
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return { seen, port: (server.address() as any).port as number, close: () => new Promise((r) => server.close(r)) };
+}
+
+test('connect lookup: refuses private answers, and answers in both net.connect forms', async () => {
+  const ask = (lookup: (h: string) => Promise<string[]>, options: any) =>
+    new Promise<{ err: Error | null; address: unknown; family?: number }>((done) =>
+      guardedLookup(lookup)('name.example', options, (err, address, family) => done({ err, address, family })));
+  const dns = (...a: string[]) => async () => a;
+
+  const one = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), {});
+  assert.deepEqual([one.err, one.address, one.family], [null, '93.184.216.34', 4]);
+  const all = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), { all: true });
+  assert.deepEqual(all.address, [{ address: '93.184.216.34', family: 4 }, { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 }]);
+  const v6 = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), { family: 6 });
+  assert.equal(v6.address, '2606:2800:220:1:248:1893:25c8:1946');
+
+  for (const answer of [['127.0.0.1'], ['169.254.169.254'], ['93.184.216.34', '10.0.0.1'], ['::1']]) {
+    const r = await ask(dns(...answer), { all: true });
+    assert.match(String(r.err?.message), /private or local address \(name\.example\)/, answer.join(','));
+  }
+  assert.match(String((await ask(dns(), {})).err?.message), /Could not resolve/);
+  assert.match(String((await ask(async () => { throw new Error('ENOTFOUND'); }, {})).err?.message), /ENOTFOUND/);
+});
+
+test('the connection uses the lookup it was given, not a second DNS query of its own', async () => {
+  const local = await localServer();
+  const asked: string[] = [];
+  // A permissive check, so the test can connect to this machine: only the plumbing is under test here.
+  const dispatcher = createDispatcher(async (h) => { asked.push(h); return ['127.0.0.1']; }, () => false);
+  try {
+    const res = await undiciFetch(`http://app.test:${local.port}/`, { dispatcher });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /secret/);
+    assert.deepEqual(asked, ['app.test'], 'app.test is not in any DNS: our lookup answered');
+    assert.deepEqual(local.seen, [`app.test:${local.port}`]);
+  } finally {
+    await dispatcher.destroy();
+    await local.close();
+  }
+});
+
+test('DNS rebinding: a name that turns private between the check and the connection is refused', async () => {
+  const local = await localServer();
+  let calls = 0;
+  // First answer public (the check passes), then this machine: a rebinding name with TTL 0.
+  const rebinding = async () => (++calls === 1 ? ['93.184.216.34'] : ['127.0.0.1']);
+  try {
+    await assert.rejects(fetchPage(`http://rebind.example:${local.port}/api/runtime-settings`, { lookup: rebinding }),
+      /Refusing to read a private or local address \(rebind\.example\)/);
+    assert.equal(calls, 2, 'resolved once for the check and once for the connection');
+    assert.deepEqual(local.seen, [], 'nothing reached the local server');
+  } finally {
+    await local.close();
+  }
 });
