@@ -45,10 +45,30 @@ export function createBus() {
   };
 }
 
-/** Show a folder in the desktop's file manager: Finder, Explorer or the freedesktop default. */
-function revealInFileManager(path: string) {
-  const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
-  execFile(cmd, [path], () => {});
+type RunFile = (cmd: string, args: string[], done: (err: (Error & { code?: unknown }) | null) => void) => unknown;
+const REVEAL_WAIT_MS = 3000;
+
+/**
+ * Show a folder in the desktop's file manager: Finder, Explorer or the freedesktop
+ * default. Rejects when the opener is missing (a headless server has no xdg-open) or
+ * exits with an error, so the button can say so instead of claiming success. An
+ * opener still running after a few seconds has opened something and counts as done.
+ * Explorer exits with 1 even when the window opened, so on Windows only a failure to
+ * start it counts.
+ */
+export function revealInFileManager(path: string, platform: NodeJS.Platform = process.platform, run: RunFile = execFile as unknown as RunFile): Promise<void> {
+  const cmd = platform === 'darwin' ? 'open' : platform === 'win32' ? 'explorer' : 'xdg-open';
+  return new Promise((resolve, reject) => {
+    const waited = setTimeout(resolve, REVEAL_WAIT_MS);
+    waited.unref?.();
+    run(cmd, [path], (err) => {
+      clearTimeout(waited);
+      if (!err || (platform === 'win32' && typeof err.code === 'number')) return resolve();
+      reject(new Error(err.code === 'ENOENT'
+        ? `Cannot show the folder: ${cmd} is not installed on the server`
+        : `Cannot show the folder: ${cmd} failed (${typeof err.code === 'number' ? `exit ${err.code}` : err.message})`));
+    });
+  });
 }
 
 /** Arc of n children pointing away from where the parent came from. */
@@ -75,7 +95,7 @@ type Deps = {
   settings: () => AppSettings;
   fetchPage?: typeof realFetchPage;
   fetchPapers?: typeof realFetchPapers;
-  reveal?: (path: string) => void;
+  reveal?: (path: string) => void | Promise<void>;
   gitInit?: boolean;
 };
 
@@ -297,10 +317,14 @@ export function createEngine(deps: Deps) {
     judge,
     createProject: (ideaId: number) => createProject(mustIdea(ideaId)),
 
-    reveal(ideaId: number) {
+    async reveal(ideaId: number) {
       const idea = mustIdea(ideaId);
       if (!idea.projectPath || !existsSync(idea.projectPath)) throw new AppError(404, 'no_project', 'The project folder is gone');
-      reveal(idea.projectPath);
+      try {
+        await reveal(idea.projectPath);
+      } catch (e: any) {
+        throw new AppError(500, 'reveal_failed', e?.message ?? String(e));
+      }
       return { ok: true };
     },
 

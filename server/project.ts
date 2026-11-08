@@ -74,9 +74,11 @@ export function slugify(s: string) {
   );
 }
 
-export function expandHome(p: string) {
+/** ~ and ~/x are under the home folder; on Windows ~\x is too. */
+export function expandHome(p: string, platform: NodeJS.Platform = process.platform) {
   const t = p.trim();
-  return t === '~' || t.startsWith('~/') ? join(homedir(), t.slice(1)) : t;
+  const home = t === '~' || t.startsWith('~/') || (platform === 'win32' && t.startsWith('~\\'));
+  return home ? join(homedir(), t.slice(1)) : t;
 }
 
 export async function writeBrief(a: {

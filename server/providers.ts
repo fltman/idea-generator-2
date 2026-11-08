@@ -6,7 +6,6 @@
 // localStorage and are pushed to the server, which keeps them in memory only.
 // Environment variables are a fallback for keys.
 
-import { isAbsolute } from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
 
 export type ProviderId = 'openrouter' | 'anthropic' | 'openai' | 'azure' | 'ollama' | 'mlx' | 'lmstudio' | 'custom';
@@ -71,6 +70,18 @@ export function parseModel(ref: string): { provider: ProviderId; model: string }
   return { provider: 'openrouter', model: ref };
 }
 
+/**
+ * A projects folder the server may create folders in: under the home folder (~/ideas,
+ * and ~\ideas on Windows) or absolute on a local disk (/srv/ideas, E:\ideas). Refused:
+ * relative paths; on Windows also \ideas and E:ideas, which depend on the current
+ * drive or its current folder, and UNC and device paths (\\host\share, //host/share,
+ * \\?\C:\), which would put projects and git repositories on another machine.
+ */
+export function isProjectsRoot(root: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform === 'win32') return !/^[\\/]{2}/.test(root) && (/^~[\\/]/.test(root) || /^[a-z]:[\\/]/i.test(root));
+  return /^~\//.test(root) || root.startsWith('/');
+}
+
 /** Merge settings pushed from the browser onto the defaults, keeping only well-typed values. */
 export function mergeAppSettings(raw: any): AppSettings {
   const s = (v: unknown, max = 500) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
@@ -80,9 +91,8 @@ export function mergeAppSettings(raw: any): AppSettings {
     if (typeof raw?.baseUrls?.[p] === 'string') out.baseUrls[p] = s(raw.baseUrls[p]).replace(/\/+$/, '');
   }
   for (const r of ROLES) if (s(raw?.models?.[r], 200)) out.models[r] = s(raw.models[r], 200);
-  // Absolute on this platform (/srv/ideas, E:\ideas) or under the home folder (~/ideas); a relative path is refused.
   const root = s(raw?.projectsRoot);
-  if (/^~\//.test(root) || isAbsolute(root)) out.projectsRoot = root;
+  if (isProjectsRoot(root)) out.projectsRoot = root;
   const max = Number(raw?.maxUsdPerDay);
   if (Number.isFinite(max) && max >= 0) out.maxUsdPerDay = Math.min(1000, max);
   return out;

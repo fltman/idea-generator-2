@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fetchPapers, normalizeUrl } from '../server/leads.ts';
 import { expandHome, renderClaudeMd, slugify, writeProject, type Brief } from '../server/project.ts';
+import { revealInFileManager } from '../server/engine.ts';
 
 test('URLs compare loosely: www, twitter.com = x.com, query and trailing slash ignored', () => {
   assert.equal(normalizeUrl('https://twitter.com/a/status/1?s=20'), normalizeUrl('https://x.com/a/status/1/'));
@@ -37,6 +38,26 @@ test('slugs are ASCII; ~ expands to home', () => {
   assert.equal(slugify('!!!'), 'idea');
   assert.equal(expandHome('~/x'), join(homedir(), 'x'));
   assert.equal(expandHome('/abs'), '/abs');
+  assert.equal(expandHome('~\\x', 'win32'), join(homedir(), '\\x'), 'Windows: ~\\ is home too');
+  assert.equal(expandHome('~\\x', 'linux'), '~\\x', 'elsewhere a backslash is part of the name');
+});
+
+test('reveal: a missing or failing opener is reported, Explorer\'s exit code 1 is not', async () => {
+  const runner = (err: any, seen: string[][] = []) => (cmd: string, args: string[], done: (e: any) => void) => {
+    seen.push([cmd, ...args]);
+    setImmediate(() => done(err));
+  };
+  const seen: string[][] = [];
+  await revealInFileManager('/p', 'linux', runner(null, seen));
+  await revealInFileManager('/p', 'darwin', runner(null, seen));
+  await revealInFileManager('E:\\p', 'win32', runner(Object.assign(new Error('exit 1'), { code: 1 }), seen));
+  assert.deepEqual(seen, [['xdg-open', '/p'], ['open', '/p'], ['explorer', 'E:\\p']]);
+
+  const missing = Object.assign(new Error('spawn xdg-open ENOENT'), { code: 'ENOENT' });
+  await assert.rejects(revealInFileManager('/p', 'linux', runner(missing)), /xdg-open is not installed/);
+  await assert.rejects(revealInFileManager('E:\\p', 'win32', runner(Object.assign(new Error('spawn explorer ENOENT'), { code: 'ENOENT' }))), /explorer is not installed/);
+  await assert.rejects(revealInFileManager('/p', 'linux', runner(Object.assign(new Error('exit 4'), { code: 4 }))), /xdg-open failed \(exit 4\)/);
+  await assert.rejects(revealInFileManager('/p', 'darwin', runner(Object.assign(new Error('exit 1'), { code: 1 }))), /open failed \(exit 1\)/);
 });
 
 const brief: Brief = {

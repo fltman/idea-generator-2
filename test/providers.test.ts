@@ -4,7 +4,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import {
-  DEFAULT_APP_SETTINGS, extractJson, keyFor, listModels, makeChat, mergeAppSettings, parseModel, ProviderError, type AppSettings,
+  DEFAULT_APP_SETTINGS, extractJson, isProjectsRoot, keyFor, listModels, makeChat, mergeAppSettings, parseModel, ProviderError, type AppSettings,
 } from '../server/providers.ts';
 
 type Seen = { path: string; headers: Record<string, any>; body: any };
@@ -53,10 +53,26 @@ test('settings from the browser are merged onto defaults, junk dropped', () => {
   assert.equal(s.models.judge, 'ollama:qwen3:8b');
   assert.equal(s.models.expand, DEFAULT_APP_SETTINGS.models.expand);
   assert.equal(s.projectsRoot, DEFAULT_APP_SETTINGS.projectsRoot, 'a relative path is refused');
-  assert.equal(mergeAppSettings({ projectsRoot: '/srv/ideas' }).projectsRoot, '/srv/ideas');
+  if (process.platform !== 'win32') assert.equal(mergeAppSettings({ projectsRoot: '/srv/ideas' }).projectsRoot, '/srv/ideas');
   assert.equal(mergeAppSettings({ projectsRoot: '~/ideas' }).projectsRoot, '~/ideas');
   if (process.platform === 'win32') assert.equal(mergeAppSettings({ projectsRoot: 'E:\\ideas' }).projectsRoot, 'E:\\ideas', 'a Windows drive path is absolute');
   assert.equal(s.maxUsdPerDay, DEFAULT_APP_SETTINGS.maxUsdPerDay);
+});
+
+test('projects folder: home or a local absolute path; on Windows not drive-relative, UNC or device paths', () => {
+  for (const ok of ['~\\ideas', '~/ideas', 'E:\\ideas', 'e:/ideas', 'C:\\Users\\me\\Projekt'])
+    assert.ok(isProjectsRoot(ok, 'win32'), `${ok} is accepted on Windows`);
+  for (const bad of ['\\ideas', '/ideas', 'E:ideas', 'E:', '\\\\host\\share\\ideas', '//host/share/ideas', '\\\\?\\C:\\ideas', '\\\\.\\C:\\ideas',
+                     '~', '~ideas', 'ideas', '..\\ideas', ''])
+    assert.ok(!isProjectsRoot(bad, 'win32'), `${bad} is refused on Windows`);
+  for (const ok of ['~/ideas', '/srv/ideas'])
+    assert.ok(isProjectsRoot(ok, 'linux'), `${ok} is accepted on Linux`);
+  for (const bad of ['~\\ideas', 'E:\\ideas', 'ideas', '~', ''])
+    assert.ok(!isProjectsRoot(bad, 'linux'), `${bad} is refused on Linux`);
+  if (process.platform === 'win32') {
+    assert.equal(mergeAppSettings({ projectsRoot: '~\\Projekt\\ideas' }).projectsRoot, '~\\Projekt\\ideas', 'a Windows home path is kept');
+    assert.equal(mergeAppSettings({ projectsRoot: '\\\\host\\share' }).projectsRoot, DEFAULT_APP_SETTINGS.projectsRoot, 'a UNC path is refused');
+  }
 });
 
 test('a key typed in the browser wins over the environment', () => {

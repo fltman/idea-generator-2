@@ -52,6 +52,7 @@ const runtime = { get: () => settings, set: (s: AppSettings) => { settings = s; 
 
 const repo = openDb(':memory:');
 const revealed: string[] = [];
+let revealFails = false;
 const pages: Record<string, { title: string; text: string }> = {
   'https://example.com/artikel': { title: 'Artikel', text: 'Lång artikeltext om lånecyklar. '.repeat(10) },
   'https://example.com/tom': { title: '', text: 'kort' },
@@ -66,7 +67,10 @@ const engine = createEngine({
     { id: '2610.1', title: 'Spatial audio', summary: 'sum', published: '2026-10-30', upvotes: 9 },
     { id: '2610.2', title: 'Other', summary: 'sum', published: '2026-10-29', upvotes: 1 },
   ],
-  reveal: (p) => revealed.push(p),
+  reveal: async (p) => {
+    if (revealFails) throw new Error('Cannot show the folder: xdg-open is not installed on the server');
+    revealed.push(p);
+  },
 });
 const autopilot = createAutopilot({ repo, engine, settings: () => settings });
 let server: Server;
@@ -191,6 +195,12 @@ test('the judge turns gold into a Claude Code project; a board can switch that o
   assert.equal(again.data.existed, true, 'one project per idea');
   await api('POST', `/api/ideas/${s.id}/reveal`, {});
   assert.deepEqual(revealed, [gold.projectPath]);
+  revealFails = true;
+  const failed = await api('POST', `/api/ideas/${s.id}/reveal`, {});
+  revealFails = false;
+  assert.equal(failed.status, 500, 'a reveal that did not open is not ok');
+  assert.equal(failed.data.code, 'reveal_failed');
+  assert.match(failed.data.error, /xdg-open is not installed/);
 
   const off = await newBoard();
   await api('PATCH', `/api/boards/${off.id}`, { config: { autoProjectOnGold: false } });
