@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { asUrl, decodeEntities, htmlToText } from '../server/extract.ts';
+import { asUrl, decodeEntities, fetchPage, htmlToText, isPrivateAddress } from '../server/extract.ts';
 
 test('recognises a lone link, with or without scheme', () => {
   assert.equal(asUrl('https://example.com/a?b=1'), 'https://example.com/a?b=1');
@@ -42,4 +42,46 @@ test('caps very long pages', () => {
   const { text } = htmlToText(`<body><p>${'ord '.repeat(5000)}</p></body>`);
   assert.ok(text.length <= 6000 + 4);
   assert.ok(text.endsWith('[…]'));
+});
+
+test('links to this machine, the LAN and link-local are refused, also after a redirect', async () => {
+  for (const a of ['127.0.0.1', '127.8.8.8', '10.0.0.5', '172.31.9.9', '192.168.1.1', '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', '::', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip'])
+    assert.ok(isPrivateAddress(a), `${a} is private`);
+  for (const a of ['93.184.216.34', '8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:8.8.8.8'])
+    assert.ok(!isPrivateAddress(a), `${a} is public`);
+
+  // Names resolve through an injected lookup: no network in the tests.
+  const dns: Record<string, string[]> = {
+    'example.com': ['93.184.216.34'], 'www.example.com': ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'],
+    'rebind.example': ['93.184.216.34', '10.0.0.5'], 'intranet.example': ['192.168.0.10'],
+  };
+  const lookup = async (h: string) => { if (!dns[h]) throw new Error('ENOTFOUND'); return dns[h]; };
+  const fetched: string[] = [];
+  const page = (title: string) => new Response(`<title>${title}</title><body><p>Text</p></body>`, { status: 200, headers: { 'content-type': 'text/html' } });
+  const fake = (async (u: URL | string | Request) => {
+    const url = String(u);
+    fetched.push(url);
+    if (url === 'https://example.com/go') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8300/api/boards' } });
+    if (url === 'https://example.com/hop') return new Response(null, { status: 301, headers: { location: '/landed' } });
+    if (url === 'https://example.com/loop') return new Response(null, { status: 302, headers: { location: '/loop' } });
+    if (url === 'https://example.com/landed') return page('Landed');
+    return page('Direct');
+  }) as typeof fetch;
+  const read = (u: string) => fetchPage(u, { fetch: fake, lookup });
+  const refused = /private or local/;
+
+  for (const u of ['http://127.0.0.1:8300/api/boards', 'http://localhost/', 'http://a.localhost/', 'http://[::1]/', 'http://169.254.169.254/latest/meta-data',
+                   'http://10.1.2.3/', 'http://192.168.1.1/admin', 'http://[fe80::1]/', 'http://intranet.example/', 'http://rebind.example/'])
+    await assert.rejects(read(u), refused, u);
+  await assert.rejects(read('ftp://example.com/'), /http/);
+  await assert.rejects(read('https://nowhere.example/'), /resolve/);
+  assert.deepEqual(fetched, [], 'nothing was fetched');
+
+  await assert.rejects(read('https://example.com/go'), refused, 'a redirect to this machine is refused');
+  assert.deepEqual(fetched, ['https://example.com/go'], 'the redirect target was never fetched');
+  fetched.length = 0;
+  assert.equal((await read('https://example.com/hop')).title, 'Landed', 'a public redirect is followed');
+  assert.deepEqual(fetched, ['https://example.com/hop', 'https://example.com/landed']);
+  assert.equal((await read('https://www.example.com/')).title, 'Direct');
+  await assert.rejects(read('https://example.com/loop'), /redirects/);
 });
