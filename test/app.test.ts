@@ -1,13 +1,14 @@
-// The request guard in app.ts: state changes are accepted only from the app's
-// own page, as JSON. Everything else about the HTTP API is in api.test.ts.
+// The request guards in app.ts: only our own Host names are answered, and state
+// changes are accepted only from the app's own page, as JSON. Everything else
+// about the HTTP API is in api.test.ts.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer, type Server } from 'node:http';
+import { createServer, request, type Server } from 'node:http';
 import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { createHandler } from '../server/app.ts';
+import { allowedHosts, createHandler } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -63,4 +64,58 @@ test('a page on another site cannot change settings or boards; the app itself an
 
   // Reads are not state changes; the browser's own same-origin policy covers them.
   assert.equal((await send('GET', '/api/boards', { Origin: 'https://evil.example' })).status, 200);
+});
+
+// fetch() will not let us lie about Host, so this goes through node:http directly.
+function withHost(port: number, host: string, method = 'GET', path = '/api/boards', body?: string) {
+  return new Promise<{ status: number; code?: string }>((done, fail) => {
+    const headers: Record<string, string> = { Host: host };
+    if (body) headers['Content-Type'] = 'application/json';
+    const r = request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
+      let raw = '';
+      res.on('data', (c) => (raw += c));
+      res.on('end', () => {
+        let code: string | undefined;
+        try { code = JSON.parse(raw).code; } catch { /* static file */ }
+        done({ status: res.statusCode!, code });
+      });
+    });
+    r.on('error', fail);
+    r.end(body);
+  });
+}
+
+test('DNS rebinding: only our own host names are answered, on our port', async () => {
+  const port = (server.address() as any).port;
+
+  // An attacker's name resolving to 127.0.0.1: refused for reads, writes and static files alike.
+  for (const [method, path, body] of [['GET', '/api/boards'], ['GET', '/api/providers'], ['GET', '/'], ['POST', '/api/boards', '{"lang":"sv"}']] as const) {
+    const r = await withHost(port, `evil.example:${port}`, method, path, body);
+    assert.equal(r.status, 403, `${method} ${path}`);
+    if (path.startsWith('/api')) assert.equal(r.code, 'bad_host');
+  }
+  assert.equal((await withHost(port, 'evil.example')).status, 403, 'no port');
+  assert.equal((await withHost(port, `127.0.0.1:${port + 1}`)).status, 403, 'our name on another port');
+  assert.equal((await withHost(port, `127.0.0.2:${port}`)).status, 403, 'another loopback address is not one of our names');
+
+  // Our own names, any case.
+  for (const h of [`localhost:${port}`, `LocalHost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`])
+    assert.equal((await withHost(port, h)).status, 200, h);
+
+  // HOST set at start-up is accepted too, and only on our port; IPv6 literals get brackets.
+  assert.ok(allowedHosts(8300, 'Ideas.LAN').has('ideas.lan:8300'));
+  assert.ok(allowedHosts(8300, 'fe80::1').has('[fe80::1]:8300'));
+  assert.ok(allowedHosts(80).has('localhost'), 'port 80 is left out of Host by browsers');
+  assert.ok(!allowedHosts(8300).has('localhost'));
+  const lan = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), host: 'Ideas.LAN' }));
+  await new Promise<void>((r) => lan.listen(0, '127.0.0.1', r));
+  try {
+    const lanPort = (lan.address() as any).port;
+    assert.equal((await withHost(lanPort, `ideas.lan:${lanPort}`)).status, 200);
+    assert.equal((await withHost(lanPort, `localhost:${lanPort}`)).status, 200, 'loopback names still work');
+    assert.equal((await withHost(lanPort, `other.lan:${lanPort}`)).status, 403);
+    assert.equal((await withHost(port, `ideas.lan:${port}`)).status, 403, 'the other server was not started with that HOST');
+  } finally {
+    lan.close();
+  }
 });

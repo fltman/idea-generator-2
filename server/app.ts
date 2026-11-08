@@ -18,7 +18,11 @@ export type Runtime = {
   received(): boolean;
 };
 
-type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string };
+type Deps = {
+  repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string;
+  /** The HOST the server was started with, accepted as a Host header besides the loopback names. */
+  host?: string;
+};
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -48,6 +52,30 @@ async function readJson(req: IncomingMessage): Promise<any> {
   } catch {
     throw new AppError(400, 'bad_json', 'Invalid JSON');
   }
+}
+
+/**
+ * Host header values this server answers to, on the port a request came in on.
+ * DNS rebinding points an attacker's name at 127.0.0.1: the browser then treats
+ * the attacker's page and this server as one origin, sends Host: evil.example,
+ * and can read every answer. Refusing any Host but our own names closes that.
+ */
+export function allowedHosts(port: number, host?: string) {
+  const names = new Set(['localhost', '127.0.0.1', '[::1]']);
+  const extra = host?.trim().toLowerCase();
+  if (extra) names.add(extra.includes(':') && !extra.startsWith('[') ? `[${extra}]` : extra);
+  const out = new Set<string>();
+  for (const n of names) {
+    out.add(`${n}:${port}`);
+    if (port === 80) out.add(n); // a browser leaves the default port out of Host
+  }
+  return out;
+}
+
+function guardHost(req: IncomingMessage, host?: string) {
+  const port = req.socket.localPort;
+  const sent = (req.headers.host ?? '').toLowerCase();
+  if (!port || !allowedHosts(port, host).has(sent)) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
 }
 
 /**
@@ -184,7 +212,7 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, publicDir, host }: Deps) {
   const root = resolve(publicDir);
 
   function providerStatus() {
@@ -346,6 +374,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
+      guardHost(req, host); // every request, reads too: a rebound page could read boards and settings
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
