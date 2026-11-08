@@ -468,7 +468,8 @@ export function openDb(file: string) {
      * boards, mean jury sum, ideas in the last `days` vs the `days` before, and
      * a per-day count series for the last `days`.
      */
-    dashboard(days = 30, limit = 40) {
+    dashboard(daysAsked = 30, limit = 40) {
+      const days = wholeDays(daysAsked); // also sizes the "previous" period below
       // Days are local, like spend and the dollar limits: an idea made just after
       // local midnight counts on the new day, wherever UTC's date line falls.
       // "Recent" is the shown days, from local midnight of the first one; "previous"
@@ -666,7 +667,8 @@ export function openDb(file: string) {
      * Everything the report window shows for the last `days` days: totals,
      * every Claude Code project, and per board its goal, summary, best ideas.
      */
-    report(days = 30) {
+    report(daysAsked = 30) {
+      const days = wholeDays(daysAsked); // the period, and the days the report says it covers
       // The period is whole local days, from local midnight of the first one: the
       // same days the dashboard shows and spend is booked on.
       const firstDay = localDays(days)[0];
@@ -752,10 +754,20 @@ export function localDay(d = new Date()) {
   return d.toLocaleDateString('sv-SE');
 }
 
+/**
+ * A number of days as a whole count, at least 1. new Date(y, m, d - k) truncates a
+ * fractional k, so 2.5 days would step back to yesterday and leave today out of the
+ * period. Every function here that takes a number of days rounds it with this, so a
+ * caller that skips the HTTP clamp (clampDays in app.ts) gets the same days.
+ */
+export function wholeDays(days: number) {
+  return Math.max(1, Math.round(days) || 1);
+}
+
 /** The last `days` local calendar days, oldest first, ending today. Calendar steps, so a DST change never skips or repeats a day. */
 export function localDays(days: number, now = new Date()) {
   const out: string[] = [];
-  for (let k = days - 1; k >= 0; k--) out.push(localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k)));
+  for (let k = wholeDays(days) - 1; k >= 0; k--) out.push(localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k)));
   return out;
 }
 

@@ -422,8 +422,9 @@ export function createEngine(deps: Deps) {
     },
 
     /** The report's conclusions across every board, saved so the window opens instantly. */
-    async synthesize(days: number, lang: 'sv' | 'en') {
-      const report = repo.report(days);
+    async synthesize(daysAsked: number, lang: 'sv' | 'en') {
+      const report = repo.report(daysAsked);
+      const days = report.days; // whole days: the prompt, the saved synthesis and the period agree
       const boards = report.boards.filter((b) => b.ideaCount);
       if (!boards.length) throw new AppError(400, 'too_few', 'There are no ideas to report on yet');
       const { synthesis } = await call(0, () =>

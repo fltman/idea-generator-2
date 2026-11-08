@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { dayOf, localDay, localDayRanges, localDays, openDb } from '../server/db.ts';
+import { dayOf, localDay, localDayRanges, localDays, openDb, wholeDays } from '../server/db.ts';
 import { MEDAL_MIN_SUM, medal, medalFromSum } from '../public/js/score.js';
 
 test('report: medals come from score.js, so a threshold change moves the report too', () => {
@@ -210,6 +210,39 @@ test('dashboard series: counted in SQLite on whole local days, across DST and od
     if (tz === undefined) delete process.env.TZ;
     else process.env.TZ = tz;
   }
+});
+
+test('a fractional number of days is rounded inside db.ts too: today stays in, and the previous period matches', () => {
+  for (const [asked, whole] of [[2.5, 3], [2.4, 2], [1.5, 2], [0.4, 1], [0, 1], [-3, 1], [NaN, 1], [7, 7]] as const)
+    assert.equal(wholeDays(asked), whole, String(asked));
+  const today = localDay();
+  for (const asked of [0.5, 1.5, 2.5, 6.6]) {
+    const days = localDays(asked);
+    assert.equal(days.length, wholeDays(asked), `${asked}: whole days`);
+    assert.equal(days.at(-1), today, `${asked}: ends today`);
+  }
+
+  // Straight to the repo, past the HTTP clamp: the same answer as the whole number.
+  const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'fraction.db');
+  const repo = openDb(file);
+  const raw = new DatabaseSync(file);
+  const board = repo.createBoard({ title: 'Bråk' });
+  const now = new Date();
+  for (const ago of [0, 1, 2, 3, 4, 5, 6]) {
+    const idea = repo.insertIdea({ boardId: board.id, title: `d${ago}`, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+    repo.setKeywords(idea.id, ['dag']);
+    const at = new Date(now.getFullYear(), now.getMonth(), now.getDate() - ago, 12);
+    raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(at.toISOString().slice(0, 19).replace('T', ' '), idea.id);
+  }
+  const d = repo.dashboard(2.5);
+  assert.deepEqual(d, repo.dashboard(3), 'dashboard(2.5) is dashboard(3)');
+  const dag = d.keywords.find((k) => k.keyword === 'dag')!;
+  assert.deepEqual(dag.series, [1, 1, 1], 'three days, today last');
+  assert.equal(dag.previous, 3, 'the previous period is three whole days too');
+  const r = repo.report(2.5);
+  assert.equal(r.days, 3);
+  assert.deepEqual(r, repo.report(3), 'report(2.5) is report(3)');
+  raw.close();
 });
 
 test('dayOf: binary search over day starts, the last start at or before the instant', () => {
