@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, createHandler, hostGuard, hostKey, INTERFACE_REFRESH_MS, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
+import { allowedHosts, createHandler, hostGuard, hostKey, hostKeys, INTERFACE_REFRESH_MS, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -144,7 +144,8 @@ test('Host and Origin are compared in one normal form', async () => {
   const ipv6 = await withHost(port, `[0:0:0:0:0:0:0:1]:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://[::1]:${port}` });
   assert.equal(ipv6.status, 200, 'same IPv6 address, spelled two ways');
   const other = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://127.0.0.1:${port}` });
-  assert.equal(other.status, 200, 'another of our own names is still us');
+  assert.equal(other.status, 403, 'another of our names is still another origin');
+  assert.equal(other.code, 'bad_origin');
   const elsewhere = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://localhost:${port + 1}` });
   assert.equal(elsewhere.status, 403, 'our name on another port is another app');
   assert.equal(elsewhere.code, 'bad_origin');
@@ -264,23 +265,64 @@ test('a wildcard bind looks its interfaces up again at most every few seconds', 
   assert.equal(lookups, 3, 'known hosts never trigger a lookup');
 });
 
-test('behind a TLS proxy the Origin is checked against our names, not the Host header', async () => {
-  const s = createServer(createHandler({
-    repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), allowedHostList: 'ideas.example.com',
-  }));
+test('a Host without a port stands for http and https; one with a port for that port only', () => {
+  assert.deepEqual(hostKeys('ideas.example.com'), ['ideas.example.com:80', 'ideas.example.com:443']);
+  assert.deepEqual(hostKeys('Ideas.Example.com'), ['ideas.example.com:80', 'ideas.example.com:443']);
+  assert.deepEqual(hostKeys('ideas.example.com:80'), ['ideas.example.com:80']);
+  assert.deepEqual(hostKeys('ideas.example.com:443'), ['ideas.example.com:443']);
+  assert.deepEqual(hostKeys('ideas.example.com:8300'), ['ideas.example.com:8300']);
+  assert.deepEqual(hostKeys('[::1]'), ['[::1]:80', '[::1]:443']);
+  assert.deepEqual(hostKeys('[::1]:8300'), ['[::1]:8300']);
+  assert.deepEqual(hostKeys('evil/path'), []);
+  assert.deepEqual(hostKeys(undefined), []);
+});
+
+test('behind a TLS proxy: name:443 matches the portless Host, and the https Origin passes', async () => {
+  const start = async (allowedHostList: string) => {
+    const s = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), allowedHostList }));
+    await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+    return { s, port: (s.address() as any).port as number };
+  };
+  const json = { 'Content-Type': 'application/json' };
+  const servers = [await start('ideas.example.com:443'), await start('ideas.example.com')];
+  try {
+    for (const { port } of servers) {
+      const write = (host: string, origin: string) => withHost(port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: origin });
+      // nginx with proxy_set_header Host $host: Host has no port, the page is https.
+      assert.equal((await withHost(port, 'ideas.example.com', 'GET', '/')).status, 200, 'the page');
+      assert.equal((await write('ideas.example.com', 'https://ideas.example.com')).status, 200, 'a write from the https page');
+      assert.equal((await write('ideas.example.com:443', 'https://ideas.example.com')).status, 200, 'the port written out');
+      // Another site is refused, and so is our name over another scheme and port pair.
+      for (const origin of ['https://evil.example', 'https://ideas.example.com.evil.example', 'null', 'https://ideas.example.com:8443']) {
+        const r = await write('ideas.example.com', origin);
+        assert.equal(r.status, 403, origin);
+        assert.equal(r.code, 'bad_origin');
+      }
+      // A proxy that rewrites Host to its upstream must pass Host on instead: the Origin is not that host.
+      const upstream = await write(`127.0.0.1:${port}`, 'https://ideas.example.com');
+      assert.equal(upstream.status, 403);
+      assert.equal(upstream.code, 'bad_origin');
+    }
+    // name:443 is that port only: a Host that names port 80 is not it.
+    const [only443] = servers;
+    assert.equal((await withHost(only443.port, 'ideas.example.com:80', 'GET', '/')).status, 403);
+    assert.equal((await withHost(only443.port, 'ideas.example.com:8443', 'GET', '/')).status, 403);
+  } finally {
+    for (const { s } of servers) s.close();
+  }
+});
+
+test('a bare ALLOWED_HOSTS name opens every port to Host, but the Origin must still be the Host', async () => {
+  const s = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), allowedHostList: 'localhost' }));
   await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
   const port = (s.address() as any).port as number;
   try {
     const json = { 'Content-Type': 'application/json' };
-    const write = (host: string, origin: string) => withHost(port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: origin });
-    // nginx with proxy_set_header Host $host: Host has no port (80), the page is https (443).
-    assert.equal((await write('ideas.example.com', 'https://ideas.example.com')).status, 200, 'Host $host');
-    // nginx's default: Host is the upstream address.
-    assert.equal((await write(`127.0.0.1:${port}`, 'https://ideas.example.com')).status, 200, 'Host rewritten to the upstream');
-    // Another site is refused however the proxy rewrites Host.
-    for (const origin of ['https://evil.example', 'https://ideas.example.com.evil.example', 'null']) {
-      const r = await write('ideas.example.com', origin);
-      assert.equal(r.status, 403, origin);
+    const write = (origin: string) => withHost(port, 'localhost:9000', 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: origin });
+    assert.equal((await write('http://localhost:9000')).status, 200, 'the forwarded app itself');
+    for (const origin of ['http://localhost:5173', 'http://localhost:3000', `http://localhost:${port}`, 'https://localhost', 'http://localhost']) {
+      const r = await write(origin);
+      assert.equal(r.status, 403, `${origin}: another local server is another app`);
       assert.equal(r.code, 'bad_origin');
     }
   } finally {
