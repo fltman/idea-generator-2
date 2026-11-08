@@ -42,7 +42,7 @@ Needs Node 25 or newer, which runs TypeScript directly. There is no build step.
 ```bash
 npm install          # two dependencies: @anthropic-ai/sdk and undici
 npm start            # http://localhost:8300
-npm test             # 90 tests, fake LLM, no network
+npm test             # 107 tests, fake LLM, no network
 npm run calibrate    # real judge vs. reference ideas (~$0.07); -- --model ollama:qwen3:8b for others
 ```
 
