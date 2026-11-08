@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, arrivalKey, createHandler, hostGuard, hostKey, hostKeys, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
+import { allowedHosts, arrivalKey, createHandler, hostGuard, hostKey, hostKeys, isWildcard, machineNames, originKey, parseAllowedHosts } from '../server/app.ts';
 import { connect } from 'node:net';
-import { networkInterfaces } from 'node:os';
+import { hostname, networkInterfaces } from 'node:os';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -323,5 +323,73 @@ test('a bare ALLOWED_HOSTS name opens every port to Host, but the Origin must st
     }
   } finally {
     s.close();
+  }
+});
+
+test('on a wildcard bind the machine\'s own name and its .local name are ours, on our port, and no other name', () => {
+  assert.deepEqual(machineNames('Studio-PC'), ['studio-pc', 'studio-pc.local']);
+  assert.deepEqual(machineNames('studio.local'), ['studio.local', 'studio']);
+  assert.deepEqual(machineNames('box.example.com.'), ['box.example.com', 'box', 'box.local']);
+  for (const junk of ['', '  ', '192.168.1.20', '::1', '[::1]', '.local']) assert.deepEqual(machineNames(junk), [], junk);
+
+  let name = 'Studio-PC';
+  for (const bind of ['0.0.0.0', '::']) {
+    const isOurs = hostGuard({ host: bind, hostname: () => name });
+    const ok = (host: string, port = 8300) => isOurs(port, hostKey(host)!, '127.0.0.1');
+    name = 'Studio-PC';
+    for (const host of ['studio-pc:8300', 'studio-pc.local:8300', 'STUDIO-PC.LOCAL:8300']) {
+      assert.equal(ok(host), true, `${bind}: ${host}`);
+    }
+    for (const host of [
+      'studio-pc:8301', 'studio-pc.local:80', 'studio-pc.local', // another port, or none
+      'other-pc.local:8300', 'evil.local:8300', 'local:8300', // another machine
+      'studio-pc.evil.example:8300', 'studio-pc.local.evil.example:8300', 'evil-studio-pc.local:8300', 'xstudio-pc:8300', // look-alikes
+    ]) {
+      assert.equal(ok(host), false, `${bind}: ${host}`);
+    }
+    // A rename is seen at once, and the old name stops working.
+    name = 'Atelier';
+    assert.equal(ok('atelier.local:8300'), true);
+    assert.equal(ok('studio-pc.local:8300'), false);
+  }
+  // A concrete HOST is reached at that address only: the machine's names are not added.
+  for (const host of ['127.0.0.1', '192.168.1.20', 'localhost']) {
+    const isOurs = hostGuard({ host, hostname: () => 'Studio-PC' });
+    assert.equal(isOurs(8300, 'studio-pc.local:8300', '127.0.0.1'), false, host);
+    assert.equal(isOurs(8300, 'studio-pc:8300', '127.0.0.1'), false, host);
+  }
+});
+
+test('end to end on a wildcard bind: the page and a write at this machine\'s real host name', async () => {
+  const json = { 'Content-Type': 'application/json' };
+  const names = machineNames(hostname());
+  assert.ok(names.length > 0, `os.hostname() gives a name: ${hostname()}`);
+  const start = async (bind: string) => {
+    const s = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), host: bind }));
+    await new Promise<void>((r) => s.listen(0, bind === '0.0.0.0' ? '127.0.0.1' : bind, r)); // reached over loopback; the guard only reads HOST
+    return { s, port: (s.address() as any).port as number };
+  };
+  const wild = await start('0.0.0.0');
+  const loop = await start('127.0.0.1');
+  try {
+    for (const name of names) {
+      const host = `${name}:${wild.port}`;
+      assert.equal((await withHost(wild.port, host, 'GET', '/')).status, 200, `the page at ${host}`);
+      assert.equal((await withHost(wild.port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://${host}` })).status, 200, `a write at ${host}`);
+      const cross = await withHost(wild.port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://${name}:5173` });
+      assert.equal(cross.status, 403, `another app on ${name}`);
+      assert.equal(cross.code, 'bad_origin');
+      const elsewhere = await withHost(loop.port, `${name}:${loop.port}`, 'GET', '/');
+      assert.equal(elsewhere.status, 403, `HOST=127.0.0.1 does not answer to ${name}`);
+      assert.equal(elsewhere.code, 'bad_host');
+    }
+    for (const host of [`not-${names[0]}.local:${wild.port}`, `${names[0]}.evil.example:${wild.port}`, `evil.example:${wild.port}`]) {
+      const r = await withHost(wild.port, host, 'GET', '/');
+      assert.equal(r.status, 403, host);
+      assert.equal(r.code, 'bad_host');
+    }
+  } finally {
+    wild.s.close();
+    loop.s.close();
   }
 });

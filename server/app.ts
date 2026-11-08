@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { isIP } from 'node:net';
+import { hostname as osHostname } from 'node:os';
 import type { Repo, Idea, Board } from './db.ts';
 import { bracketed, unbracketed } from './hosts.ts';
 import { AppError, type Engine } from './engine.ts';
@@ -173,17 +174,36 @@ export function parseAllowedHosts(list: string | undefined) {
  * reached us at 192.168.1.20, whichever interface that is and however recently it
  * came up. A rebinding page cannot use this: its Host is its own name, never our address.
  */
-export function hostGuard(opts: { host?: string; allowedHostList?: string } = {}) {
+export function hostGuard(opts: { host?: string; allowedHostList?: string; hostname?: () => string } = {}) {
   const extra = parseAllowedHosts(opts.allowedHostList);
   const wildcard = !!opts.host && isWildcard(opts.host);
+  const hostname = opts.hostname ?? osHostname;
   const cache = new Map<number, Set<string>>();
   return (port: number, sent: string, arrivedAt?: string): boolean => {
     if (extra.keys.has(sent) || extra.names.has(hostnameOfKey(sent))) return true;
     let names = cache.get(port);
     if (!names) cache.set(port, (names = allowedHosts(port, opts.host)));
     if (names.has(sent)) return true;
-    return wildcard && sent === arrivalKey(arrivedAt, port);
+    if (!wildcard) return false;
+    if (sent === arrivalKey(arrivedAt, port)) return true;
+    // The machine's own names, read now (a rename needs no restart), on our port only.
+    return machineNames(hostname()).some((name) => hostKey(`${name}:${port}`) === sent);
   };
+}
+
+/**
+ * The names other machines on the network use for this one, from os.hostname():
+ * the name itself, its first label, and that label's mDNS name (label.local).
+ * "Studio-PC" gives studio-pc and studio-pc.local; "studio.local" gives studio.local
+ * and studio; "box.example.com" also gives box and box.local. An address or an
+ * empty name gives nothing: addresses are handled by the arrival address.
+ */
+export function machineNames(hostname: string): string[] {
+  const full = hostname.trim().toLowerCase().replace(/\.$/, '');
+  if (!full || isIP(unbracketed(full)) !== 0) return [];
+  const label = full.split('.')[0];
+  if (!label) return [];
+  return [...new Set([full, label, `${label}.local`])];
 }
 
 function guardHost(req: IncomingMessage, isOurs: (port: number, sent: string, arrivedAt?: string) => boolean) {

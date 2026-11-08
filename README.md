@@ -42,7 +42,7 @@ Needs Node 25 or newer, which runs TypeScript directly. There is no build step.
 ```bash
 npm install          # two dependencies: @anthropic-ai/sdk and undici
 npm start            # http://localhost:8300
-npm test             # 86 tests, fake LLM, no network
+npm test             # 88 tests, fake LLM, no network
 npm run calibrate    # real judge vs. reference ideas (~$0.07); -- --model ollama:qwen3:8b for others
 ```
 
@@ -53,7 +53,7 @@ The server reads its own settings from the environment:
 | Variable | Default | What it does |
 |---|---|---|
 | `PORT` | `8300` | The port to listen on. |
-| `HOST` | `127.0.0.1` | The address to listen on. `HOST=0.0.0.0` (or `::`) listens on every interface and also answers to the address each connection arrives on, so a tablet or a second screen on your network can open `http://192.168.1.20:8300`. Addresses that appear later, from Wi-Fi or a VPN, work at once, without a restart. |
+| `HOST` | `127.0.0.1` | The address to listen on. `HOST=0.0.0.0` (or `::`) listens on every interface and also answers to the address each connection arrives on, so a tablet or a second screen on your network can open `http://192.168.1.20:8300`. It also answers to this machine's own name from `os.hostname()` and its mDNS name, such as `http://studio-pc.local:8300`, on its own port; other names are refused. Addresses that appear later, from Wi-Fi or a VPN, work at once, without a restart. |
 | `ALLOWED_HOSTS` | none | More names the server answers to, separated by commas. A bare name works on any port, for a port forward or a proxy: `ALLOWED_HOSTS=localhost` with `ssh -L 9000:localhost:8300`. A `name:port` entry works on that port only; behind an HTTPS proxy that forwards `Host` without a port, `name:443` matches it. A malformed entry stops the server at start-up. |
 | `DB_FILE` | `data/ideas.db` | Where the SQLite database lives. |
 
