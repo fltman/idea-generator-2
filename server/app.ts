@@ -107,14 +107,26 @@ export function hostKey(header: string | undefined): string | null {
  * only. One without a port means 80 to a plain browser request, but a TLS proxy that
  * forwards Host as is (nginx: proxy_set_header Host $host) also sends it without a
  * port for https on 443, so a portless Host stands for both name:80 and name:443.
- * Parsing as both http and https tells "name" apart from "name:80" and "name:443",
- * which the URL parser otherwise folds into the same host.
+ * One URL parse gives the key; whether the header names a port is read off the text,
+ * since the parser folds "name" and "name:80" into the same host. Called once per
+ * request, by the handler, for both guards.
  */
 export function hostKeys(header: string | undefined): string[] {
   const key = hostKey(header);
   if (!key) return [];
-  const namesPort = new URL(`http://${header}`).port !== '' || new URL(`https://${header}`).port !== '';
-  return namesPort ? [key] : [key, `${hostnameOfKey(key)}:443`];
+  return namesPort(header!) ? [key] : [key, `${hostnameOfKey(key)}:443`];
+}
+
+/**
+ * Does a Host header that hostKey accepted write a port (":80", ":080", ":8300")?
+ * Read on the part the URL parser takes as host[:port]: it drops every tab and
+ * newline and trailing controls and spaces, skips any / or \ right after "http://",
+ * and stops the authority at the next / ? # or \ ("name:80/" and "name:80?" are
+ * name:80 too). An empty port ("name:") names none.
+ */
+function namesPort(header: string): boolean {
+  const authority = header.replace(/[\t\n\r]/g, '').replace(/[\x00-\x20]+$/, '').replace(/^[/\\]+/, '').split(/[/?#\\]/)[0];
+  return /:\d+$/.test(authority);
 }
 
 /** An Origin header in normal form, or null for "null", other schemes and junk. */
@@ -226,9 +238,8 @@ export const PROXY_HINT =
  * case gets the hint: a page from another local server (http://localhost:5173) is
  * simply not this app.
  */
-export function badOriginMessage(origin: string, from: string | null, host: string | undefined) {
+export function badOriginMessage(origin: string, from: string | null, host: string | undefined, sent = hostKey(host)) {
   const base = `Requests from ${origin} are not accepted`;
-  const sent = hostKey(host);
   if (!from || !sent || !isLoopbackName(hostnameOfKey(sent)) || isLoopbackName(hostnameOfKey(from))) return base;
   return `${base}: they reached the server with Host ${host}, a loopback name, so a reverse proxy probably rewrote it. ` +
     `Have the proxy pass the browser's Host on (nginx: proxy_set_header Host $host;) and list ${hostnameOfKey(from)} in ALLOWED_HOSTS.`;
@@ -247,10 +258,11 @@ export function hostNote(allowedHostList: string | undefined): string {
     '(nginx: proxy_set_header Host $host;), or writes from the browser are refused (403 bad_origin).';
 }
 
-function guardHost(req: IncomingMessage, isOurs:(port: number, sent: string, arrivedAt?: string) => boolean) {
+/** `sent` is hostKeys(Host), computed once per request by the handler. */
+function guardHost(req: IncomingMessage, sent: string[], isOurs: (port: number, sent: string, arrivedAt?: string) => boolean) {
   const port = req.socket.localPort;
   const arrivedAt = req.socket.localAddress;
-  const sent = hostKeys(req.headers.host); // a portless Host also matches an ALLOWED_HOSTS name:443
+  // A portless Host also matches an ALLOWED_HOSTS name:443.
   if (!port || !sent.some((key) => isOurs(port, key, arrivedAt))) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
 }
 
@@ -270,13 +282,13 @@ function guardHost(req: IncomingMessage, isOurs:(port: number, sent: string, arr
  * without a port, which an https page behind a TLS proxy also arrives with, so its
  * Origin may be https://name as well as http://name (see hostKeys).
  */
-function guardMutation(req: IncomingMessage) {
+function guardMutation(req: IncomingMessage, sent: string[]) {
   const method = req.method ?? 'GET';
   if (method === 'GET' || method === 'HEAD') return;
   const origin = req.headers.origin;
   if (origin !== undefined) {
     const from = originKey(origin); // null for "null" or junk: not us
-    if (!from || !hostKeys(req.headers.host).includes(from)) throw new AppError(403, 'bad_origin', badOriginMessage(origin, from, req.headers.host));
+    if (!from || !sent.includes(from)) throw new AppError(403, 'bad_origin', badOriginMessage(origin, from, req.headers.host, sent[0] ?? null));
   }
   if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
     throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
@@ -557,12 +569,13 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
-      guardHost(req, isOurs); // every request, reads too: a rebound page could read boards and settings
+      const sent = hostKeys(req.headers.host); // one parse of Host, for both guards
+      guardHost(req, sent, isOurs); // every request, reads too: a rebound page could read boards and settings
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
       }
-      guardMutation(req);
+      guardMutation(req, sent);
       const ev = url.pathname.match(/^\/api\/boards\/(\d+)\/events$/);
       if (ev && req.method === 'GET') return events(+ev[1], req, res);
       for (const [method, re, fn] of routes) {

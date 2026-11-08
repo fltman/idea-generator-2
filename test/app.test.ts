@@ -182,6 +182,59 @@ test('the start-up note says what a reverse proxy needs, with or without ALLOWED
   assert.match(set, /403 bad_origin/);
 });
 
+/** hostKeys as it was, with two extra URL parses to learn whether a port was written: the reference. */
+function hostKeysByThreeParses(header: string | undefined): string[] {
+  const key = hostKey(header);
+  if (!key) return [];
+  const writesPort = new URL(`http://${header}`).port !== '' || new URL(`https://${header}`).port !== '';
+  return writesPort ? [key] : [key, `${key.slice(0, key.lastIndexOf(':'))}:443`];
+}
+
+/** Count `new URL` calls while f runs. */
+async function urlParses(f: () => unknown) {
+  const Real = globalThis.URL;
+  let n = 0;
+  globalThis.URL = new Proxy(Real, { construct: (target, args) => (n++, Reflect.construct(target, args)) });
+  try {
+    await f();
+  } finally {
+    globalThis.URL = Real;
+  }
+  return n;
+}
+
+test('hostKeys reads "has a port" off the header: the same keys as parsing it as http and https', () => {
+  const tricky = [
+    'name', 'name:80', 'name:443', 'name:8300', 'name:080', 'name:0', 'name:', 'NAME:80', 'name:65535', 'name:65536',
+    'name/', 'name:80/', 'name?', 'name:80?', 'name#', 'name:80#', 'name\\', 'name:80\\', 'name:80/./', 'name:80/..', 'name:80/%2e',
+    'name:80 ', 'name:80\t', 'na\tme:80', 'name:8\t0', 'name:\n80', 'name\r:443', ' name', 'name:80\x01',
+    '[::1]', '[::1]:80', '[::1]:', '[0:0::1]:443', '[::ffff:127.0.0.1]:8300', '127.1', '127.1:80', '0x7f.1:443', '%41', 'xn--bcher-kva.example:80',
+    'user@name:80', 'name:80/path', 'name:abc', 'name:80:80', '', ':80', '[::1', 'name:80?q',
+    // The parser skips any run of / and \ after "http://": found by the random headers below.
+    '\\1:1?', '/name:80', '\\\\name:443/', '/\\/name', '\t/name:80', '/\tname:8300',
+  ];
+  for (const h of tricky) assert.deepEqual(hostKeys(h), hostKeysByThreeParses(h), JSON.stringify(h));
+  // And random headers over the characters that matter.
+  let seed = 3;
+  const rand = (n: number) => ((seed = (seed * 48271) % 2147483647) % n);
+  const alphabet = ['a', 'b', 'Z', '0', '8', ':', ':', '.', '/', '?', '#', '\\', '[', ']', '\t', '\n', ' ', '@', '%', '1'];
+  for (let i = 0; i < 20_000; i++) {
+    const h = Array.from({ length: 1 + rand(10) }, () => alphabet[rand(alphabet.length)]).join('');
+    assert.deepEqual(hostKeys(h), hostKeysByThreeParses(h), JSON.stringify(h));
+  }
+});
+
+test('one URL parse per Host header, and one hostKeys per request for both guards', async () => {
+  assert.equal(await urlParses(() => hostKeys('ideas.example.com')), 1);
+  assert.equal(await urlParses(() => hostKeys('ideas.example.com:443')), 1);
+  // A write through the handler: req.url, the Host header once, the Origin once, then
+  // the 404 for an unknown route. Before, Host was parsed three times in each guard.
+  const port = (server.address() as any).port;
+  const write = () => withHost(port, `localhost:${port}`, 'POST', '/api/no-such-route', '{}', { Origin: `http://localhost:${port}` });
+  assert.equal((await write()).status, 404, 'past both guards'); // warm: the allowed names are built once per port
+  assert.equal(await urlParses(write), 3);
+});
+
 test('the loopback and HOST names are per port', () => {
   const named = hostGuard({ host: 'Ideas.LAN' });
   assert.ok(named(8300, 'ideas.lan:8300') && named(8300, 'localhost:8300') && named(9000, 'ideas.lan:9000'));
