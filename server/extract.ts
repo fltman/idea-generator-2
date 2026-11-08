@@ -6,6 +6,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import type { LookupAddress } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
 import { Agent, fetch as undiciFetch } from 'undici';
+import { unbracketed } from './hosts.ts';
 
 const MAX_BYTES = 2_000_000;
 const MAX_CHARS = 6000;
@@ -16,21 +17,25 @@ const TIMEOUT_MS = 12_000;
 // machine, the LAN, link-local (cloud metadata lives at 169.254.169.254), and the
 // unroutable blocks. A visitor types a URL in exhibition mode; without this the
 // server would fetch http://127.0.0.1:8300/api/... or a router's admin page.
+// The documentation blocks (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and the
+// retired 6to4 relay anycast (192.88.99.0/24) are never a real public site either.
 const PRIVATE = new BlockList();
 for (const [net, bits] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
-  ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
+  ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
+  ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv4');
 // IPv6: ::/96 is unspecified, loopback and the old IPv4-compatible form (::10.0.0.1);
 // 64:ff9b::/96 and the local-use 64:ff9b:1::/48 are NAT64, which a DNS64 network
 // translates to the embedded IPv4 (64:ff9b::a9fe:a9fe reaches 169.254.169.254);
-// ::ffff:0:0:0/96 is the SIIT IPv4-translated form; 2002::/16 is 6to4, also embedding
-// IPv4; fec0::/10 is the retired site-local range; then unique-local, link-local, multicast.
+// ::ffff:0:0:0/96 is the SIIT IPv4-translated form; 2002::/16 is 6to4 and 2001::/32 is
+// Teredo, both tunnels that embed IPv4; 2001:db8::/32 is for documentation;
+// fec0::/10 is the retired site-local range; then unique-local, link-local, multicast.
 // IPv4-mapped addresses (::ffff:a.b.c.d, which URL writes as ::ffff:7f00:1) need no
 // rule of their own: BlockList checks them against the IPv4 subnets above.
 for (const [net, bits] of [
-  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2002::', 16],
-  ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['2001::', 32], ['2001:db8::', 32],
+  ['2002::', 16], ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
 
 /** True for loopback, LAN, link-local, multicast and unroutable addresses, and for anything that is not an IP. */
@@ -49,7 +54,7 @@ const refusal = (name: string) => new PrivateAddressError(`Refusing to read a pr
 /** Throws unless the URL is http(s) to a public host; every address the name resolves to must be public. */
 export async function assertPublicUrl(url: URL, lookup: Lookup = realLookup) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error(`Only http(s) links can be read (${url.protocol})`);
-  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const host = unbracketed(url.hostname).toLowerCase();
   const refuse = () => refusal(url.hostname);
   if (host === 'localhost' || host.endsWith('.localhost')) throw refuse();
   if (isIP(host)) {

@@ -7,12 +7,13 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
   - Only Host headers naming this server are answered (DNS rebinding). `HOST=0.0.0.0` or `::` adds this machine's interface addresses.
   - Behind a port forward or proxy, list the names in `ALLOWED_HOSTS` (comma separated): a bare name is accepted on any port, `name:port` on that port only.
-- `npm test` – 76 tests (`node --test`), fake LLM and fake provider servers, no network
+- `npm test` – 80 tests (`node --test`), fake LLM and fake provider servers, no network
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
 
-- `server/require-node-25.js` – stops an older Node with a clear message (plain JS, preloaded by `npm start` and imported first by `index.ts`).
+- `server/require-node-25.js` – stops an older Node with a clear message (plain JS, preloaded by `npm start` and `npm run dev`; that preload is the reliable guard, the import in `index.ts` only helps when the rest still loads).
+- `server/hosts.ts` – IPv6 brackets on and off, shared by the Host/Origin guard (`app.ts`) and the private-address guard (`extract.ts`).
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
   - Anthropic uses the official SDK with `output_config.format`.

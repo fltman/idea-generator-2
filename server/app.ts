@@ -8,6 +8,7 @@ import { extname, join, resolve, sep } from 'node:path';
 import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import type { Repo, Idea, Board } from './db.ts';
+import { bracketed, unbracketed } from './hosts.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
 import { PROVIDERS, keySource, listModels, mergeAppSettings, type AppSettings, type ProviderId } from './providers.ts';
@@ -73,7 +74,7 @@ async function readJson(req: IncomingMessage): Promise<any> {
  */
 export function allowedHosts(port: number, host?: string, interfaces: () => ReturnType<typeof networkInterfaces> = networkInterfaces) {
   const names = ['localhost', '127.0.0.1', '[::1]'];
-  const add = (n: string) => names.push(n.includes(':') && !n.startsWith('[') ? `[${n}]` : n);
+  const add = (n: string) => names.push(bracketed(n));
   const extra = host?.trim();
   if (extra && isWildcard(extra)) for (const address of interfaceAddresses(interfaces)) add(address);
   else if (extra) add(extra);
@@ -117,7 +118,7 @@ export function originKey(origin: string | undefined): string | null {
 
 /** 0.0.0.0, ::, [::] and other spellings of "every address": a bind, not a name anyone browses to. */
 export function isWildcard(host: string) {
-  const bare = host.trim().replace(/^\[|\]$/g, '');
+  const bare = unbracketed(host);
   return isIP(bare) !== 0 && /^[0:.]+$/.test(bare);
 }
 
@@ -140,7 +141,7 @@ export function parseAllowedHosts(list: string | undefined) {
   const names = new Set<string>();
   const keys = new Set<string>();
   for (const raw of (list ?? '').split(/[\s,]+/).filter(Boolean)) {
-    const entry = raw.includes(':') && !raw.startsWith('[') && isIP(raw) === 6 ? `[${raw}]` : raw;
+    const entry = bracketed(raw);
     const key = hostKey(entry);
     if (!key) throw new Error(`ALLOWED_HOSTS: "${raw}" is not a host name`);
     if (/:\d+$/.test(entry)) keys.add(key);

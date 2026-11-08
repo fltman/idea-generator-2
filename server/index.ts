@@ -1,4 +1,9 @@
-// Keep this import first: it stops an older Node with a clear message.
+// The Node version guard. The one that counts is the --import preload in the npm
+// scripts: ESM loads and links every import of this file before running any of them,
+// so an import an older Node cannot load (a missing builtin, TypeScript it cannot
+// strip) fails before this line runs, and the message never shows. Imported here
+// as well, first, for `node server/index.ts` run by hand: there it helps only when
+// everything below still loads on that Node.
 import './require-node-25.js';
 import { createServer } from 'node:http';
 import { mkdirSync } from 'node:fs';
