@@ -405,7 +405,17 @@ export function openDb(file: string) {
         .map((r: any) => ({ ideaId: r.origin_idea_id, boardId: r.board_id, title: r.title }));
     },
     deleteBoard(id: number) {
-      return db.prepare('DELETE FROM boards WHERE id = ?').run(id).changes > 0;
+      // The spend ledger has no foreign key, and board ids are reused: left under this
+      // id, today's spend would count against the next board that gets it. It moves to
+      // board 0 (spend that belongs to no board), so totals and history keep it.
+      return tx(() => {
+        db.prepare(
+          `INSERT INTO spend (board_id, day, usd, calls) SELECT 0, day, usd, calls FROM spend WHERE board_id = ?
+           ON CONFLICT(board_id, day) DO UPDATE SET usd = usd + excluded.usd, calls = calls + excluded.calls`,
+        ).run(id);
+        db.prepare('DELETE FROM spend WHERE board_id = ?').run(id);
+        return db.prepare('DELETE FROM boards WHERE id = ?').run(id).changes > 0;
+      });
     },
 
     // ---- ideas
