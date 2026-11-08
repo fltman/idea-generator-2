@@ -1,8 +1,12 @@
-// The report query against an in-memory database: medals must be the ones score.js
-// gives everywhere else in the app, thresholds included.
+// The report and dashboard queries: medals must be the ones score.js gives
+// everywhere else in the app, and days must be the local days spend is booked on.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { openDb } from '../server/db.ts';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { localDay, localDays, openDb } from '../server/db.ts';
 import { MEDAL_MIN_SUM, medal, medalFromSum } from '../public/js/score.js';
 
 test('report: medals come from score.js, so a threshold change moves the report too', () => {
@@ -32,4 +36,54 @@ test('report: medals come from score.js, so a threshold change moves the report 
   assert.equal(best[1].medal, medalFromSum(MEDAL_MIN_SUM[3]));
   // Every reported medal equals what the browser computes for the same idea.
   for (const b of best) assert.equal(b.medal, medal(repo.getIdea(b.id)));
+});
+
+test('dashboard days are local days, the same ones spend is booked on', () => {
+  // Far from UTC, so the local and UTC dates differ for 13 hours of every day.
+  const tz = process.env.TZ;
+  process.env.TZ = 'Pacific/Auckland';
+  try {
+    const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'days.db');
+    const repo = openDb(file);
+    const raw = new DatabaseSync(file);
+    const board = repo.createBoard({ title: 'Dagar' });
+
+    // Half an hour after local midnight today (or yesterday, if today is younger than that).
+    const now = new Date();
+    let at = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 30);
+    if (at > now) at = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 30);
+    assert.notEqual(localDay(at), at.toISOString().slice(0, 10), 'this instant is on different dates locally and in UTC');
+    const idea = repo.insertIdea({ boardId: board.id, title: 'Tidig', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+    repo.setKeywords(idea.id, ['natt']);
+    raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(at.toISOString().slice(0, 19).replace('T', ' '), idea.id);
+
+    const d = repo.dashboard(7);
+    assert.deepEqual(d.days, localDays(7));
+    assert.equal(d.days.at(-1), localDay(), 'the last day is today, the day spend is booked on');
+    const series = d.keywords.find((k) => k.keyword === 'natt')!.series;
+    assert.equal(series[d.days.indexOf(localDay(at))], 1, 'counted on its local day');
+    assert.equal(series.reduce((a, b) => a + b, 0), 1, 'and on no other');
+
+    // Spend booked today shows up in a one-day report: both use the same local day.
+    repo.addSpend(board.id, 0.25);
+    assert.equal(repo.spentOn(board.id, d.days.at(-1)), 0.25);
+    assert.equal(repo.report(1).totals.spentUsd, 0.25);
+    raw.close();
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
+
+test('local days step by calendar, across a DST change', () => {
+  const tz = process.env.TZ;
+  process.env.TZ = 'Europe/Stockholm';
+  try {
+    // Summer time ended on 2026-10-25 in Sweden: that day had 25 hours.
+    assert.deepEqual(localDays(3, new Date(2026, 9, 26, 0, 10)), ['2026-10-24', '2026-10-25', '2026-10-26']);
+    assert.deepEqual(localDays(3, new Date(2026, 2, 30, 23, 50)), ['2026-03-28', '2026-03-29', '2026-03-30']);
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
 });

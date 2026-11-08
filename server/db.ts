@@ -484,21 +484,23 @@ export function openDb(file: string) {
            LIMIT ?`,
         )
         .all(since, since, before, limit) as any[];
+      // Days are local, like spend and the dollar limits: an idea made just after
+      // local midnight counts on the new day, wherever UTC's date line falls.
+      const dayList = localDays(days);
       const seriesRows = db
         .prepare(
-          `SELECT k.keyword, substr(i.created_at, 1, 10) AS day, COUNT(*) AS n
+          `SELECT k.keyword, i.created_at
            FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
-           WHERE i.created_at >= datetime('now', ?)
-           GROUP BY k.keyword, day`,
+           WHERE i.created_at >= ?`,
         )
-        .all(since) as any[];
-      const dayList: string[] = [];
-      for (let d = days - 1; d >= 0; d--) dayList.push(new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10));
+        .all(sqlUtc(localMidnight(dayList[0]))) as any[];
+      const dayIndex = new Map(dayList.map((d, n) => [d, n]));
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
+        const at = dayIndex.get(localDay(fromSqlUtc(r.created_at)));
+        if (at === undefined) continue;
         if (!series.has(r.keyword)) series.set(r.keyword, dayList.map(() => 0));
-        const at = dayList.indexOf(r.day);
-        if (at >= 0) series.get(r.keyword)![at] = r.n;
+        series.get(r.keyword)![at]++;
       }
       const boards = db
         .prepare(
@@ -675,7 +677,7 @@ export function openDb(file: string) {
         else if (m === 2) medals.silver++;
         else if (m === 1) medals.bronze++;
       }
-      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(localDay(new Date(Date.now() - (days - 1) * 86_400_000)));
+      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(localDays(days)[0]);
       const latest: any = db.prepare('SELECT * FROM reports ORDER BY id DESC LIMIT 1').get();
       return {
         days,
@@ -734,3 +736,20 @@ export type Repo = ReturnType<typeof openDb>;
 export function localDay(d = new Date()) {
   return d.toLocaleDateString('sv-SE');
 }
+
+/** The last `days` local calendar days, oldest first, ending today. Calendar steps, so a DST change never skips or repeats a day. */
+export function localDays(days: number, now = new Date()) {
+  const out: string[] = [];
+  for (let k = days - 1; k >= 0; k--) out.push(localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k)));
+  return out;
+}
+
+/** The instant a local day (YYYY-MM-DD) begins. */
+function localMidnight(day: string) {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
+const sqlUtc = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');
+const fromSqlUtc = (s: string) => new Date(`${s.replace(' ', 'T')}Z`);
