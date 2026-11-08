@@ -1,3 +1,5 @@
+// Keep this import first: it stops an older Node with a clear message.
+import './require-node-25.js';
 import { createServer } from 'node:http';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';

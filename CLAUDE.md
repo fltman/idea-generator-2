@@ -10,6 +10,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 
 ## Layout
 
+- `server/require-node-25.js` – stops an older Node with a clear message (plain JS, preloaded by `npm start` and imported first by `index.ts`).
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
   - Anthropic uses the official SDK with `output_config.format`.
