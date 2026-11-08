@@ -85,7 +85,11 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
   async function tick() {
     const t = now();
     const globalSpent = repo.spentOn(null);
-    for (const b of repo.listBoards()) {
+    const boards = repo.listBoards();
+    // A deleted board is gone from the list: forget its state, or the map grows with every board ever made.
+    const alive = new Set(boards.map((b) => b.id));
+    for (const id of states.keys()) if (!alive.has(id)) states.delete(id);
+    for (const b of boards) {
       if (b.config.mode !== 'auto') {
         if (states.delete(b.id)) engine.bus.emit(b.id, { type: 'autopilot', status: { state: 'manual' } });
         continue;
@@ -148,6 +152,10 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
     },
     status(boardId: number): AutopilotStatus {
       return states.get(boardId)?.status ?? { state: 'manual' };
+    },
+    /** Boards the scheduler currently keeps state for. */
+    tracked(): number[] {
+      return [...states.keys()];
     },
   };
 }

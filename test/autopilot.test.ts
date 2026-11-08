@@ -98,6 +98,39 @@ test('scheduler: only auto boards run, at their pace, within their limits', asyn
   assert.equal(ap.status(auto.id).state, 'manual');
 });
 
+test('scheduler: a deleted board is forgotten, also while its step is still running', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine, steps } = fakeEngineFor(repo);
+  const ap = createAutopilot({ repo, engine, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const config = { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } };
+  const keep = repo.createBoard({ title: 'Keep', config });
+  const gone = repo.createBoard({ title: 'Gone', config });
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+
+  await ap.tick(); await flush();
+  assert.deepEqual(ap.tracked().sort(), [keep.id, gone.id].sort());
+  assert.equal(ap.status(gone.id).state, 'pace');
+
+  repo.deleteBoard(gone.id);
+  now += 20_000; await ap.tick(); await flush();
+  assert.deepEqual(ap.tracked(), [keep.id], 'the deleted board has no state left');
+  assert.equal(ap.status(gone.id).state, 'manual');
+  assert.ok(!steps.slice(2).includes(gone.id), 'and no step ran for it');
+
+  // Deleted between the start of a step and its result: the late result does not bring the entry back.
+  let release!: () => void;
+  const slow = { ...engine, autoStep: (id: number) => new Promise<{ did: 'combine' }>((r) => { release = () => r({ did: 'combine' }); steps.push(id); }) };
+  const ap2 = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  await ap2.tick();
+  assert.equal(ap2.status(keep.id).state, 'running');
+  repo.deleteBoard(keep.id);
+  await ap2.tick();
+  release(); await flush();
+  await ap2.tick();
+  assert.deepEqual(ap2.tracked(), []);
+});
+
 test('autoStep with the real engine: judge first, grow a small pool, then breed', async () => {
   const repo = openDb(':memory:');
   let n = 0;
