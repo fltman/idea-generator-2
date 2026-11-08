@@ -97,7 +97,7 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
         // Forgetting them would let a manual-auto toggle start a second step beside the
         // first, or skip the hourly limit and the backoff.
         const s = states.get(b.id);
-        if (s && !s.busy) publish(b.id, s, { state: 'manual' });
+        if (s && !s.busy) publish(b.id, s, { state: 'manual', last: s.status.last }); // the last result stays visible
         continue;
       }
       let s = states.get(b.id);
@@ -123,21 +123,31 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
       s.busy = true;
       publish(b.id, s, { state: 'running', last: s.status.last, ...counts });
       const st = s;
+      // A step can outlast the board's auto mode: the user switches it to manual (or
+      // deletes it) while the step runs. Its result still counts toward the limits, but
+      // the status it shows is manual, not a pace or backoff of an autopilot that is off.
+      const stillAuto = () => repo.getBoard(b.id)?.config.mode === 'auto';
       engine
         .autoStep(b.id)
         .then((r) => {
           if (r.did !== 'idle') st.steps.push(now());
           st.lastAt = now();
           st.errors = 0;
+          const last = r.did === 'idle' ? r.reason : r.did;
+          if (!stillAuto()) return publish(b.id, st, { state: 'manual', last });
           publish(b.id, st, {
             state: r.did === 'idle' ? 'idle' : 'pace', until: now() + b.config.autopilotSeconds * 1000,
-            last: r.did === 'idle' ? r.reason : r.did, stepsLastHour: st.steps.length, spentToday: counts.spentToday,
+            last, stepsLastHour: st.steps.length, spentToday: counts.spentToday,
           });
         })
         .catch((e: any) => {
           st.errors++;
           st.lastErrorAt = st.lastAt = now();
-          publish(b.id, st, { state: 'error', code: e?.code ?? 'error', message: e?.message ?? String(e), until: now() + backoffMs(st.errors), ...counts });
+          const last = st.status.last;
+          if (!stillAuto()) return publish(b.id, st, { state: 'manual', last });
+          publish(b.id, st, {
+            state: 'error', code: e?.code ?? 'error', message: e?.message ?? String(e), until: now() + backoffMs(st.errors), last, ...counts,
+          });
         })
         .finally(() => {
           st.busy = false;

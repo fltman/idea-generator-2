@@ -207,3 +207,46 @@ test('scheduler: switching a board to manual and back neither doubles a running 
   assert.equal(ap2.status(other.id).state, 'backoff', 'still backing off');
   assert.equal(failing.steps.length, 0);
 });
+
+test('scheduler: a step that ends after the board went manual shows manual, and the last result is kept', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let settle!: { ok: () => void; fail: () => void };
+  const slow = {
+    ...engine,
+    autoStep: () => new Promise<{ did: 'combine' }>((ok, fail) => {
+      settle = { ok: () => ok({ did: 'combine' }), fail: () => fail(Object.assign(new Error('no key'), { code: 'no_key' })) };
+    }),
+  };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'Late', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  const mode = (m: 'auto' | 'manual') => repo.updateBoard(board.id, { config: { mode: m } });
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+  const shown: string[] = [];
+  engine.bus.on(board.id, (e: any) => { if (e.type === 'autopilot') shown.push(e.status.state); });
+
+  // A step succeeds after the board went manual, before the next tick noticed.
+  await ap.tick();
+  mode('manual');
+  settle.ok(); await flush();
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
+  await ap.tick();
+  assert.deepEqual(shown, ['running', 'manual'], 'no pace for an autopilot that is off, and manual only once');
+
+  // Back on auto: it paces from that step, and still shows what it did last.
+  mode('auto'); now += 1_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'pace');
+  assert.equal(ap.status(board.id).last, 'combine');
+
+  // A step fails after the board went manual: no error status, but the backoff still counts.
+  now += 20_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'running');
+  mode('manual');
+  settle.fail(); await flush();
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
+  assert.ok(!shown.includes('error'));
+  mode('auto'); now += 1_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'backoff');
+  assert.equal(ap.status(board.id).last, 'combine', 'the last result survives manual, error and backoff');
+});
