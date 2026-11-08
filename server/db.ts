@@ -493,26 +493,26 @@ export function openDb(file: string) {
            LIMIT ?`,
         )
         .all(since, since, before, limit) as any[];
-      // The series is counted in SQLite, one row per keyword and day, and only for the
-      // keywords shown. The day boundaries come from JS: SQLite's 'localtime' reads the
-      // zone once per process, while JS follows TZ, and JS steps whole calendar days
-      // across a DST change. Day n is the pair ranges[n] = [start, stop).
+      // The series covers only the keywords shown. The day boundaries come from JS:
+      // SQLite's 'localtime' reads the zone once per process, while JS follows TZ, and
+      // JS steps whole calendar days across a DST change. Day n is ranges[n] = [start, stop).
+      // SQLite counts each keyword's ideas per instant inside the window; JS puts each
+      // instant on its day by binary search over the day starts, log2(days) steps a
+      // row. (A range join against the days had no index: every row met every day.)
       const seriesRows = db
         .prepare(
-          `WITH days AS (SELECT CAST(key AS INTEGER) AS n, json_extract(value, '$[0]') AS start, json_extract(value, '$[1]') AS stop
-                         FROM json_each(?))
-           SELECT k.keyword, d.n AS day, COUNT(*) AS count
+          `SELECT k.keyword, i.created_at AS at, COUNT(*) AS count
            FROM idea_keywords k
            JOIN ideas i ON i.id = k.idea_id
-           JOIN days d ON i.created_at >= d.start AND i.created_at < d.stop
            WHERE i.created_at >= ? AND i.created_at < ? AND k.keyword IN (SELECT value FROM json_each(?))
-           GROUP BY k.keyword, d.n`,
+           GROUP BY k.keyword, i.created_at`,
         )
-        .all(JSON.stringify(ranges), since, until, JSON.stringify(rows.map((r) => r.keyword))) as any[];
+        .all(since, until, JSON.stringify(rows.map((r) => r.keyword))) as any[];
+      const starts = ranges.map(([start]) => start);
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
         if (!series.has(r.keyword)) series.set(r.keyword, dayList.map(() => 0));
-        series.get(r.keyword)![r.day] = r.count;
+        series.get(r.keyword)![dayOf(starts, r.at)] += r.count;
       }
       const boards = db
         .prepare(
@@ -775,6 +775,26 @@ export function localDayRanges(dayList: string[]): [string, string][] {
     const start = localMidnight(day);
     return [sqlUtc(start), sqlUtc(new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1))];
   });
+}
+
+/**
+ * The day an instant falls on: the index of the last start at or before `at`, by
+ * binary search over consecutive day starts (each day stops where the next begins),
+ * or -1 before the first. Plain string order, as SQLite compares these ASCII
+ * timestamps, so a row lands on the same day the SQL range test would put it on.
+ */
+export function dayOf(starts: string[], at: string): number {
+  let lo = 0;
+  let hi = starts.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (starts[mid] <= at) {
+      found = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found;
 }
 
 /** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */

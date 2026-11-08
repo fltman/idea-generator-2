@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { localDay, localDayRanges, localDays, openDb } from '../server/db.ts';
+import { dayOf, localDay, localDayRanges, localDays, openDb } from '../server/db.ts';
 import { MEDAL_MIN_SUM, medal, medalFromSum } from '../public/js/score.js';
 
 test('report: medals come from score.js, so a threshold change moves the report too', () => {
@@ -203,6 +203,90 @@ test('dashboard series: counted in SQLite on whole local days, across DST and od
         }
         assert.deepEqual(k.series, expected, `${zone}: ${k.keyword}`);
         assert.equal(k.series.reduce((a, b) => a + b, 0), k.recent, `${zone}: ${k.keyword} recent matches its series`);
+      }
+      raw.close();
+    }
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
+
+test('dayOf: binary search over day starts, the last start at or before the instant', () => {
+  const starts = ['2026-11-05 23:00:00', '2026-11-06 23:00:00', '2026-11-07 23:00:00'];
+  assert.equal(dayOf(starts, '2026-11-05 22:59:59'), -1, 'before the first day');
+  assert.equal(dayOf(starts, '2026-11-05 23:00:00'), 0, 'the first second of day 0');
+  assert.equal(dayOf(starts, '2026-11-06 22:59:59'), 0, 'the last second of day 0');
+  assert.equal(dayOf(starts, '2026-11-06 23:00:00'), 1);
+  assert.equal(dayOf(starts, '2026-11-07 12:00:00'), 1);
+  assert.equal(dayOf(starts, '2026-11-08 22:59:59'), 2, 'the last day has no stop of its own; the query bounds it');
+  assert.equal(dayOf([], '2026-11-07 12:00:00'), -1);
+  // Against a linear scan, for every list length up to 40 and instants on and around each start.
+  for (let len = 1; len <= 40; len++) {
+    const list = Array.from({ length: len }, (_, n) => `2026-01-${String(n + 1).padStart(2, '0')} 00:00:00`);
+    for (const s of list)
+      for (const at of [s, s.replace('00:00:00', '12:00:00'), s.replace(' 00:00:00', ' -')]) {
+        let linear = -1;
+        list.forEach((start, n) => { if (start <= at) linear = n; });
+        assert.equal(dayOf(list, at), linear, `${len} days, ${at}`);
+      }
+  }
+});
+
+test('dashboard series: the same counts as the range join it replaced, on the same rows', () => {
+  const tz = process.env.TZ;
+  try {
+    for (const zone of ['Europe/Stockholm', 'Asia/Kathmandu']) {
+      process.env.TZ = zone;
+      const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'same-counts.db');
+      const repo = openDb(file);
+      const raw = new DatabaseSync(file);
+      const board = repo.createBoard({ title: 'Samma' });
+      const add = (keywords: string[], at: string) => {
+        const idea = repo.insertIdea({ boardId: board.id, title: keywords.join(' '), pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+        repo.setKeywords(idea.id, keywords);
+        raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(at, idea.id);
+      };
+      const days = 120;
+      const ranges = localDayRanges(localDays(days));
+      const sql = (ms: number) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+      const ms = (s: string) => new Date(`${s.replace(' ', 'T')}Z`).getTime();
+      let seed = 11;
+      const rand = () => ((seed = (seed * 48271) % 2147483647) / 2147483647);
+      const words = ['sol', 'vind', 'vatten', 'jord', 'eld'];
+      const span = ms(ranges[days - 1][1]) - ms(ranges[0][0]);
+      for (let n = 0; n < 600; n++) {
+        const at = sql(ms(ranges[0][0]) - 5 * 86_400_000 + rand() * (span + 10 * 86_400_000));
+        add([words[n % 5], words[(n * 3 + 1) % 5]].filter((w, i, a) => a.indexOf(w) === i), at);
+      }
+      for (const [start, stop] of ranges.filter((_, n) => n % 7 === 0)) {
+        add(['sol'], start);
+        add(['sol', 'vind'], start); // two ideas at the same instant
+        add(['vind'], sql(ms(stop) - 1000));
+        add(['eld'], `${start}.250`); // a value with fractional seconds
+        add(['eld'], start.replace(' ', 'T')); // and one with a T, which sorts after a space
+      }
+
+      const d = repo.dashboard(days, 4);
+      // The query this replaced, run on the same database and keywords.
+      const old = raw
+        .prepare(
+          `WITH days AS (SELECT CAST(key AS INTEGER) AS n, json_extract(value, '$[0]') AS start, json_extract(value, '$[1]') AS stop
+                         FROM json_each(?))
+           SELECT k.keyword, d.n AS day, COUNT(*) AS count
+           FROM idea_keywords k
+           JOIN ideas i ON i.id = k.idea_id
+           JOIN days d ON i.created_at >= d.start AND i.created_at < d.stop
+           WHERE i.created_at >= ? AND i.created_at < ? AND k.keyword IN (SELECT value FROM json_each(?))
+           GROUP BY k.keyword, d.n`,
+        )
+        .all(JSON.stringify(ranges), ranges[0][0], ranges[days - 1][1], JSON.stringify(d.keywords.map((k) => k.keyword))) as any[];
+      assert.equal(d.keywords.length, 4);
+      for (const k of d.keywords) {
+        const expected = d.days.map(() => 0);
+        for (const r of old) if (r.keyword === k.keyword) expected[r.day] = r.count;
+        assert.ok(expected.some((n) => n > 0), `${zone}: ${k.keyword} has ideas in the window`);
+        assert.deepEqual(k.series, expected, `${zone}: ${k.keyword}`);
       }
       raw.close();
     }
