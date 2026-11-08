@@ -300,6 +300,9 @@ const parseJson = (s: string) => {
 const BOARD_SELECT = `SELECT b.*, oi.title AS origin_idea_title, oi.board_id AS origin_board_id, ob.title AS origin_board_title
   FROM boards b LEFT JOIN ideas oi ON oi.id = b.origin_idea_id LEFT JOIN boards ob ON ob.id = oi.board_id`;
 
+/** Every board, most recently changed first: the board list and the report. */
+const BOARDS_IN_ORDER = `SELECT * FROM (${BOARD_SELECT}) b2 ORDER BY b2.updated_at DESC, b2.id DESC`;
+
 const boardFromRow = (r: any): Board => ({
   id: r.id,
   title: r.title,
@@ -356,9 +359,7 @@ export function openDb(file: string) {
     // ---- boards
     listBoards() {
       return db
-        .prepare(
-          `SELECT * FROM (${BOARD_SELECT}) b2 ORDER BY b2.updated_at DESC, b2.id DESC`,
-        )
+        .prepare(BOARDS_IN_ORDER)
         .all()
         .map((r: any) => ({
           ...boardFromRow(r),
@@ -669,11 +670,14 @@ export function openDb(file: string) {
       // The period is whole local days, from local midnight of the first one: the
       // same days the dashboard shows and spend is booked on.
       const firstDay = localDays(days)[0];
-      const boards = repo.listBoards();
+      // Boards without listBoards()' per-board idea counts: the report counts each
+      // board's ideas from its own list.
+      const boards = (db.prepare(BOARDS_IN_ORDER).all() as any[]).map(boardFromRow);
+      // One read of the ideas table. created_at is SQLite's UTC text, which sorts like
+      // the instant it names, so comparing it here is the comparison SQLite would make.
       const ideas = (db.prepare(`${IDEA_SELECT} ORDER BY i.id`).all() as any[]).map(ideaFromRow);
-      const recentIds = new Set(
-        (db.prepare(`SELECT id FROM ideas WHERE created_at >= ?`).all(sqlUtc(localMidnight(firstDay))) as any[]).map((r) => r.id),
-      );
+      const since = sqlUtc(localMidnight(firstDay));
+      const isNew = (i: Idea) => i.createdAt >= since;
       // Sums and medals come from score.js, like everywhere else: it holds the thresholds, and a hand-set medal wins.
       const rank = (x: Idea, y: Idea) => (scoreSum(y) ?? -1) - (scoreSum(x) ?? -1) || y.id - x.id;
       const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: scoreSum(i), medal: medal(i), reason: i.reason, kind: i.kind });
@@ -695,7 +699,7 @@ export function openDb(file: string) {
         totals: {
           boards: boards.length,
           ideas: ideas.length,
-          newIdeas: recentIds.size,
+          newIdeas: ideas.filter(isNew).length,
           judged: ideas.filter((i) => i.judgedAt).length,
           medals,
           projects: projects.length,
@@ -706,7 +710,7 @@ export function openDb(file: string) {
           const own = ideas.filter((i) => i.boardId === b.id);
           return {
             id: b.id, title: b.title, goal: b.goal, mode: b.config.mode,
-            ideaCount: own.length, newIdeas: own.filter((i) => recentIds.has(i.id)).length,
+            ideaCount: own.length, newIdeas: own.filter(isNew).length,
             best: own.filter((i) => scoreSum(i) != null || i.medalOverride != null).sort(rank).slice(0, 3).map(brief),
             summary: b.summary ? { ...b.summary, stale: b.summary.ideaCount !== own.length } : null,
             projects: projects.filter((p) => p.boardId === b.id),

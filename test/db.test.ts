@@ -264,3 +264,49 @@ test('local day ranges: one [start, stop) pair per day, no gap or overlap, 23 or
     else process.env.TZ = tz;
   }
 });
+
+test('report: one read of the ideas table, the same local days and score.js medals', () => {
+  const tz = process.env.TZ;
+  process.env.TZ = 'America/St_Johns'; // UTC-3:30 or -2:30: local midnight is never a whole UTC hour
+  const prepare = DatabaseSync.prototype.prepare;
+  try {
+    const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'report-once.db');
+    const repo = openDb(file);
+    const raw = new DatabaseSync(file);
+    const a = repo.createBoard({ title: 'Ett' });
+    const b = repo.createBoard({ title: 'Två' });
+    const start = new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() - 1); // the first local day of a 2-day report
+    const sql = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');
+    const add = (board: number, at: Date, scores?: [number, number, number]) => {
+      const idea = repo.insertIdea({ boardId: board, title: 't', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+      if (scores) repo.saveJudgement(idea.id, { originality: scores[0], feasibility: scores[1], impact: scores[2], reason: 'r' });
+      raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(sql(at), idea.id);
+      return idea.id;
+    };
+    add(a.id, start, [5, 5, 5]); // the first second of the period: new, gold
+    add(a.id, new Date(start.getTime() - 1000), [4, 4, 3]); // the last second before it: old, silver
+    add(b.id, new Date(start.getTime() + 12 * 3_600_000), [3, 3, 3]); // inside, bronze
+    add(b.id, new Date(start.getTime() - 40 * 86_400_000), [1, 1, 1]); // long ago, no medal
+
+    const reads: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: DatabaseSync, text: string) {
+      if (/\bFROM ideas\b/.test(text)) reads.push(text);
+      return prepare.call(this, text);
+    } as typeof prepare;
+    const r = repo.report(2);
+    DatabaseSync.prototype.prepare = prepare;
+
+    assert.equal(reads.length, 1, `the ideas table is read once:\n${reads.join('\n---\n')}`);
+    assert.equal(r.totals.ideas, 4);
+    assert.equal(r.totals.newIdeas, 2, 'from local midnight of the first day, that second included');
+    assert.equal(r.totals.newIdeas, repo.dashboard(2).totals.recent, 'the same days as the dashboard');
+    assert.deepEqual(Object.fromEntries(r.boards.map((x) => [x.title, x.newIdeas])), { Ett: 1, Två: 1 });
+    assert.deepEqual(r.totals.medals, { gold: 1, silver: 1, bronze: 1 });
+    for (const x of r.boards) for (const i of x.best) assert.equal(i.medal, medalFromSum(i.sum), `${i.id}: medal from score.js`);
+    raw.close();
+  } finally {
+    DatabaseSync.prototype.prepare = prepare;
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
