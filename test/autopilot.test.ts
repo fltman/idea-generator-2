@@ -193,6 +193,59 @@ test('scheduler: a board deleted without forget() is still dropped at the next t
   assert.deepEqual(ap.tracked(), []);
 });
 
+test('a deleted board\'s step that is still waiting on the model writes nothing into a new board with the same id', async () => {
+  // Three ways an autoStep reaches the model: judging new ideas, expanding, combining.
+  for (const scenario of ['judge', 'expand', 'combine'] as const) {
+    const repo = openDb(':memory:');
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const asked: string[] = [];
+    const chat = async (r: ChatRequest) => {
+      asked.push(r.schemaName);
+      await held;
+      const value =
+        r.schemaName === 'expand' ? { ideas: [1, 2].map((k) => ({ title: `Gammal ${k}`, pitch: 'p' })) }
+        : r.schemaName === 'judgement' ? { reason: 'r', originality: 5, feasibility: 5, impact: 5, keywords: ['gammal'] }
+        : { title: 'Gammal korsning', pitch: 'p' };
+      return { value, costUsd: 0.25 };
+    };
+    const engine = createEngine({ repo, chat, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
+    const old = repo.createBoard({ title: 'Gammal', config: { autoProjectOnGold: true } });
+    const count = scenario === 'combine' ? 3 : 1;
+    const oldIdeas = Array.from({ length: count }, (_, k) =>
+      repo.insertIdea({ boardId: old.id, title: `Frö ${k}`, pitch: 'p', kind: 'seed', x: k * 200, y: 0, generation: 0 }));
+    if (scenario !== 'judge') for (const i of oldIdeas) repo.saveJudgement(i.id, { originality: 3, feasibility: 3, impact: 3, reason: 'r' });
+    // A combine needs every idea expanded once already: give each a judged child.
+    if (scenario === 'combine') for (const p of oldIdeas) {
+      const c = repo.insertIdea({ boardId: old.id, title: `Barn ${p.id}`, pitch: 'p', kind: 'expand', x: 0, y: 99, generation: 1 }, [p.id]);
+      repo.saveJudgement(c.id, { originality: 3, feasibility: 3, impact: 3, reason: 'r' });
+    }
+
+    const step = engine.autoStep(old.id).then(() => null, (e: any) => e);
+    await new Promise((r) => setTimeout(r, 10)); // waiting on the model now
+    assert.deepEqual(asked, [scenario === 'judge' ? 'judgement' : scenario], `${scenario}: the step is waiting on that call`);
+
+    engine.deleteBoard(old.id);
+    const reused = repo.createBoard({ title: 'Ny', config: { autoProjectOnGold: true } });
+    assert.equal(reused.id, old.id, 'the id is handed out again');
+    const own = repo.insertIdea({ boardId: reused.id, title: 'Egen idé', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+    assert.equal(own.id, oldIdeas[0].id, 'and so is an idea id');
+    const events: any[] = [];
+    engine.bus.on(reused.id, (e: any) => events.push(e));
+
+    release();
+    const err = await step;
+    await engine.idle();
+    assert.equal(err?.code, 'board_deleted', `${scenario}: the step ends with board_deleted`);
+    assert.deepEqual(repo.listIdeas(reused.id).map((i) => i.title), ['Egen idé'], `${scenario}: no idea from the old board`);
+    assert.equal(repo.getIdea(own.id)!.originality, null, `${scenario}: the new board's idea was not judged by the old step`);
+    assert.deepEqual(repo.listEdges(reused.id), [], `${scenario}: no edges`);
+    assert.deepEqual(events, [], `${scenario}: nothing published on the new board`);
+    assert.equal(repo.spentOn(reused.id), 0, `${scenario}: the new board is not charged`);
+    assert.ok(repo.spentOn(null) > 0, `${scenario}: the spend still counts toward the global limit`);
+  }
+});
+
 test('autoStep with the real engine: judge first, grow a small pool, then breed', async () => {
   const repo = openDb(':memory:');
   let n = 0;

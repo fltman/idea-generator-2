@@ -493,7 +493,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
     }],
     ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => {
       autopilot.forget(+id); // before the id can be handed to a new board
-      return { ok: repo.deleteBoard(+id) };
+      return { ok: engine.deleteBoard(+id) }; // and model calls still running for it drop their results
     }],
     ['PUT', /^\/api\/boards\/(\d+)\/positions$/, ([id], b) => {
       if (!repo.getBoard(+id)) throw new AppError(404, 'not_found', 'Board not found');

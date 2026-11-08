@@ -16,10 +16,12 @@ let judgeScores = { originality: 3, feasibility: 3, impact: 3 };
 let judgeKeywords = ['Public Space', 'sound'];
 let failNext: Error | null = null;
 let xCitations: string[] = [];
+let holdChat: Promise<void> | null = null; // while set, every model call waits for it
 
 // Fake chat: answers by schema name, records every request.
 async function fakeChat(r: ChatRequest) {
   calls.push(r);
+  if (holdChat) await holdChat;
   if (failNext) {
     const e = failNext;
     failNext = null;
@@ -318,6 +320,31 @@ test('dashboard: keyword trends across boards, and drill-down', async () => {
   const { data: drill } = await api('GET', `/api/keywords/${encodeURIComponent('trend keyword')}/ideas`);
   assert.deepEqual(drill.ideas.map((i: any) => i.boardTitle).sort(), ['D1', 'D2']);
   judgeKeywords = ['public space', 'sound'];
+});
+
+test('DELETE /api/boards/:id: an expand still waiting on the model ends with board_deleted, not in the board that reuses the id', async () => {
+  await engine.idle();
+  const gone = await newBoard({ title: 'Raderas' });
+  const parent = await seed(gone.id, 'Förälder');
+  await engine.idle();
+
+  let release!: () => void;
+  holdChat = new Promise<void>((r) => (release = r));
+  const expanding = api('POST', `/api/ideas/${parent.id}/expand`, {});
+  await new Promise((r) => setTimeout(r, 20)); // the expand waits on the model
+
+  assert.equal((await api('DELETE', `/api/boards/${gone.id}`)).status, 200);
+  const next = await newBoard({ title: 'Ny' });
+  assert.equal(next.id, gone.id, 'the new board gets the deleted board\'s id');
+
+  holdChat = null;
+  release();
+  const r = await expanding;
+  assert.equal(r.status, 409);
+  assert.equal(r.data.code, 'board_deleted');
+  await engine.idle();
+  const { data } = await api('GET', `/api/boards/${next.id}`);
+  assert.deepEqual(data.ideas, [], 'nothing from the old board\'s expand');
 });
 
 test('live events: a browser following a board sees what happens', async () => {

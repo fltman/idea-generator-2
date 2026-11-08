@@ -134,22 +134,38 @@ export function createEngine(deps: Deps) {
   const emitIdeas = (boardId: number, ideas: Idea[]) => ideas.length && bus.emit(boardId, { type: 'ideas', ideas });
 
   /** Every LLM call: spend lands on the board's ledger; failures become 502s that keep the provider's code. */
+  // Board ids are reused (INTEGER PRIMARY KEY without AUTOINCREMENT): once the newest
+  // board is deleted, the next board created gets its id, and the same goes for ideas.
+  // An operation that was waiting on the model when its board was deleted must not
+  // write its result into whatever board holds that id now. Every delete of an id is
+  // counted here, and call() refuses a result that comes back after one.
+  const deletions = new Map<number, number>();
+  const deletesOf = (boardId: number) => deletions.get(boardId) ?? 0;
+
   async function call<T extends { costUsd: number }>(boardId: number, fn: () => Promise<T>): Promise<T> {
+    const before = deletesOf(boardId);
+    let out: T;
     try {
-      const out = await fn();
-      repo.addSpend(boardId, out.costUsd);
-      return out;
+      out = await fn();
     } catch (e: any) {
       if (e instanceof AppError) throw e;
       throw new AppError(502, e instanceof ProviderError ? e.code : 'llm_failed', e?.message ?? String(e));
     }
+    if (deletesOf(boardId) !== before) {
+      // The money is spent: book it to no board (0), so the global limit still sees it
+      // and the board that now has this id is not charged.
+      repo.addSpend(0, out.costUsd);
+      throw new AppError(409, 'board_deleted', 'The board was deleted while the model was working');
+    }
+    repo.addSpend(boardId, out.costUsd);
+    return out;
   }
 
   // ---------------------------------------------------------------- judging
 
-  function setJudging(boardId: number, ids: number[], on: boolean) {
+  function setJudging(boardId: number, ids: number[], on: boolean, emit = true) {
     for (const id of ids) on ? judging.add(id) : judging.delete(id);
-    bus.emit(boardId, { type: 'judging', ids, on });
+    if (emit) bus.emit(boardId, { type: 'judging', ids, on });
   }
 
   async function createProject(idea: Idea) {
@@ -172,6 +188,7 @@ export function createEngine(deps: Deps) {
   async function judge(ideaId: number) {
     const idea = mustIdea(ideaId);
     const board = mustBoard(idea.boardId);
+    const deletes = deletesOf(board.id);
     setJudging(board.id, [idea.id], true);
     try {
       const { judgement } = await call(board.id, () =>
@@ -190,13 +207,15 @@ export function createEngine(deps: Deps) {
           out.project = p.path;
           bus.emit(board.id, { type: 'project', ideaId: idea.id, path: p.path, byJudge: true });
         } catch (e: any) {
+          if (e?.code === 'board_deleted') throw e; // not a project error: the board is gone
           out.projectError = e?.message ?? String(e);
         }
       }
       emitIdeas(board.id, [out.idea]);
       return out;
     } finally {
-      setJudging(board.id, [idea.id], false);
+      // Tell the board's page the spinner is off, unless the board is gone: its id may be another board's now.
+      setJudging(board.id, [idea.id], false, deletesOf(board.id) === deletes);
     }
   }
 
@@ -210,6 +229,7 @@ export function createEngine(deps: Deps) {
       active++;
       judge(id)
         .catch((e: any) => {
+          if (e?.code === 'board_deleted') return; // the idea's id may belong to another board's idea now
           const boardId = repo.getIdea(id)?.boardId;
           if (boardId) bus.emit(boardId, { type: 'error', code: e?.code ?? 'judge_failed', message: e?.message ?? String(e), ideaId: id });
         })
@@ -327,6 +347,16 @@ export function createEngine(deps: Deps) {
 
     judge,
     createProject: (ideaId: number) => createProject(mustIdea(ideaId)),
+
+    /**
+     * Delete a board, and make every operation still waiting on the model for it
+     * drop its result (see call()). Delete boards through here, not repo.deleteBoard:
+     * the next board can get the same id.
+     */
+    deleteBoard(boardId: number) {
+      deletions.set(boardId, deletesOf(boardId) + 1);
+      return repo.deleteBoard(boardId);
+    },
 
     async reveal(ideaId: number) {
       const idea = mustIdea(ideaId);
