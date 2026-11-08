@@ -448,6 +448,53 @@ test('on a wildcard bind the machine\'s own name and its .local name are ours, o
   }
 });
 
+test('wildcard bind: a refused Host costs no parsing, and hostname() only on our port', async () => {
+  let name = 'Studio-PC';
+  let reads = 0;
+  const isOurs = hostGuard({ host: '0.0.0.0', hostname: () => (reads++, name) });
+  const ok = (sent: string, port = 8300) => isOurs(port, sent, '192.168.1.20');
+  assert.equal(ok('studio-pc.local:8300'), true, 'warm: the loopback names and the machine keys are built');
+
+  // Another port: refused before the arrival address or the machine's names.
+  reads = 0;
+  assert.equal(await urlParses(() => { for (let i = 0; i < 100; i++) ok('evil.example:8301'); }), 0);
+  assert.equal(reads, 0, 'no hostname() for a Host on another port');
+  assert.equal(ok('studio-pc.local:18300'), false, 'a port that merely ends in ours is another port');
+
+  // Our port, an unknown name: one hostname() and the arrival address, no machine-name parsing.
+  reads = 0;
+  const parses = await urlParses(() => { for (let i = 0; i < 100; i++) ok('evil.example:8300'); });
+  assert.equal(reads, 100, 'the name is still read on every such request, so a rename is seen at once');
+  assert.equal(parses, 100, 'one parse each, for the arrival address; the machine keys are not rebuilt');
+
+  // A rename rebuilds the keys once.
+  name = 'Atelier';
+  assert.equal(await urlParses(() => ok('atelier.local:8300')), 1 + machineNames('Atelier').length, 'arrival + one parse per new name');
+  assert.equal(await urlParses(() => ok('atelier:8300')), 1, 'then the arrival address only');
+  assert.equal(ok('studio-pc.local:8300'), false, 'the old name is gone');
+});
+
+test('wildcard bind: the same decisions as reading and parsing the machine names on every request', () => {
+  // The guard as it was, for the machine names: the reference.
+  const before = (port: number, sent: string, arrivedAt: string, name: string) =>
+    allowedHosts(port, '0.0.0.0').has(sent) || sent === arrivalKey(arrivedAt, port) ||
+    machineNames(name).some((n) => hostKey(`${n}:${port}`) === sent);
+  let name = 'Studio-PC';
+  const isOurs = hostGuard({ host: '0.0.0.0', hostname: () => name });
+  const names = ['Studio-PC', 'studio.local', 'Atelier', 'box.example.com', '192.168.1.20', ''];
+  const hosts = ['studio-pc', 'studio-pc.local', 'studio', 'studio.local', 'atelier.local', 'box', 'box.local', 'box.example.com',
+                 'evil.example', 'localhost', '127.0.0.1', '192.168.1.20', '[::1]', '10.0.0.7', 'xstudio-pc'];
+  let seed = 9;
+  const rand = (n: number) => ((seed = (seed * 48271) % 2147483647) % n);
+  for (let i = 0; i < 5000; i++) {
+    if (rand(10) === 0) name = names[rand(names.length)]; // renames now and then
+    const port = [8300, 8301, 80][rand(3)];
+    const sent = hostKey(`${hosts[rand(hosts.length)]}:${[8300, 8301, 80, 18300][rand(4)]}`)!;
+    const arrivedAt = ['192.168.1.20', '10.0.0.7', '::ffff:10.0.0.7', '127.0.0.1'][rand(4)];
+    assert.equal(isOurs(port, sent, arrivedAt), before(port, sent, arrivedAt, name), `${name} ${port} ${sent} ${arrivedAt}`);
+  }
+});
+
 test('end to end on a wildcard bind: the page and a write at this machine\'s real host name', async () => {
   const json = { 'Content-Type': 'application/json' };
   const names = machineNames(hostname());

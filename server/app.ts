@@ -194,15 +194,28 @@ export function hostGuard(opts: { host?: string; allowedHostList?: string; hostn
   const wildcard = !!opts.host && isWildcard(opts.host);
   const hostname = opts.hostname ?? osHostname;
   const cache = new Map<number, Set<string>>();
+  // The machine's names as keys on each port, for the hostname() they were built from.
+  const machine = new Map<number, { from: string; keys: Set<string> }>();
   return (port: number, sent: string, arrivedAt?: string): boolean => {
     if (extra.keys.has(sent) || extra.names.has(hostnameOfKey(sent))) return true;
     let names = cache.get(port);
     if (!names) cache.set(port, (names = allowedHosts(port, opts.host)));
     if (names.has(sent)) return true;
     if (!wildcard) return false;
+    // The arrival address and the machine's names count on our port only: a Host on
+    // any other port is refused here, before any parsing or a call to hostname().
+    if (!sent.endsWith(`:${port}`)) return false;
     if (sent === arrivalKey(arrivedAt, port)) return true;
-    // The machine's own names, read now (a rename needs no restart), on our port only.
-    return machineNames(hostname()).some((name) => hostKey(`${name}:${port}`) === sent);
+    // The machine's own names, read now (a rename needs no restart). Their keys are
+    // rebuilt only when the name changes, so a stream of refused Hosts (scanners,
+    // rebinding attempts) costs one hostname() and a set lookup each.
+    const from = hostname();
+    let known = machine.get(port);
+    if (!known || known.from !== from) {
+      const keys = machineNames(from).map((name) => hostKey(`${name}:${port}`)).filter((key): key is string => key !== null);
+      machine.set(port, (known = { from, keys: new Set(keys) }));
+    }
+    return known.keys.has(sent);
   };
 }
 
