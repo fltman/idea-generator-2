@@ -12,4 +12,4 @@ demo/
 
 # graft code index: its graph cache and the ripgrep config it writes at the root. Regenerable with `graft build`.
 graft/
-.ignore
+/.ignore

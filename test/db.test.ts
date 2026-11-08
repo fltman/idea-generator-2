@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { localDay, localDays, openDb } from '../server/db.ts';
+import { localDay, localDayRanges, localDays, openDb } from '../server/db.ts';
 import { MEDAL_MIN_SUM, medal, medalFromSum } from '../public/js/score.js';
 
 test('report: medals come from score.js, so a threshold change moves the report too', () => {
@@ -206,6 +206,59 @@ test('dashboard series: counted in SQLite on whole local days, across DST and od
       }
       raw.close();
     }
+  } finally {
+    if (tz === undefined) delete process.env.TZ;
+    else process.env.TZ = tz;
+  }
+});
+
+test('local day ranges: one [start, stop) pair per day, no gap or overlap, 23 or 25 hours across DST', () => {
+  const tz = process.env.TZ;
+  const fromSql = (s: string) => new Date(`${s.replace(' ', 'T')}Z`);
+  try {
+    // Stockholm: spring forward on 29 March 2026, fall back on 25 October 2026.
+    process.env.TZ = 'Europe/Stockholm';
+    const days = localDays(400, new Date(2026, 10, 8, 12));
+    const ranges = localDayRanges(days);
+    assert.equal(ranges.length, days.length);
+    const hours = new Map<string, number>();
+    ranges.forEach(([start, stop], n) => {
+      assert.ok(start < stop, `${days[n]}: start before stop`);
+      if (n + 1 < ranges.length) assert.equal(stop, ranges[n + 1][0], `${days[n]} stops where the next day starts`);
+      assert.equal(localDay(fromSql(start)), days[n], `${days[n]}: the first second is that day`);
+      assert.equal(localDay(new Date(fromSql(stop).getTime() - 1000)), days[n], `${days[n]}: the last second is that day`);
+      hours.set(days[n], (fromSql(stop).getTime() - fromSql(start).getTime()) / 3_600_000);
+    });
+    assert.equal(hours.get('2026-03-29'), 23, 'spring forward');
+    assert.equal(hours.get('2026-10-25'), 25, 'fall back');
+    assert.equal([...hours.values()].filter((h) => h !== 24).length, 3, 'each DST change once: October 2025, March and October 2026');
+    assert.deepEqual(localDayRanges(['2026-11-08']), [['2026-11-07 23:00:00', '2026-11-08 23:00:00']]);
+
+    // The dashboard counts over those ranges: an idea at the last second of today is in
+    // today's series; one at tomorrow's first second is in recent but in no day.
+    process.env.TZ = 'Asia/Kathmandu';
+    const file = join(mkdtempSync(join(tmpdir(), 'ideagen-db-')), 'ranges.db');
+    const repo = openDb(file);
+    const raw = new DatabaseSync(file);
+    const board = repo.createBoard({ title: 'Gränser' });
+    const today = localDayRanges(localDays(1))[0];
+    const at = (keyword: string, sql: string) => {
+      const idea = repo.insertIdea({ boardId: board.id, title: keyword, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+      repo.setKeywords(idea.id, [keyword]);
+      raw.prepare('UPDATE ideas SET created_at = ? WHERE id = ?').run(sql, idea.id);
+    };
+    const shift = (sql: string, seconds: number) => new Date(fromSql(sql).getTime() + seconds * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    at('kant', today[0]);
+    at('kant', shift(today[1], -1));
+    at('kant', today[1]);
+    at('kant', shift(today[0], -1));
+    const d = repo.dashboard(1, 5);
+    const kant = d.keywords.find((k) => k.keyword === 'kant')!;
+    assert.deepEqual(kant.series, [2], 'the first and last second of today');
+    assert.equal(kant.recent, 3, 'recent has no upper bound');
+    assert.equal(kant.previous, 1, 'the last second of yesterday');
+    assert.equal(d.totals.recent, 3);
+    raw.close();
   } finally {
     if (tz === undefined) delete process.env.TZ;
     else process.env.TZ = tz;

@@ -473,8 +473,10 @@ export function openDb(file: string) {
       // "Recent" is the shown days, from local midnight of the first one; "previous"
       // is the same number of whole local days before that.
       const dayList = localDays(days);
+      const ranges = localDayRanges(dayList);
+      const since = ranges[0][0];
+      const until = ranges[ranges.length - 1][1];
       const first = localMidnight(dayList[0]);
-      const since = sqlUtc(first);
       const before = sqlUtc(new Date(first.getFullYear(), first.getMonth(), first.getDate() - days));
       const rows = db
         .prepare(
@@ -493,14 +495,11 @@ export function openDb(file: string) {
       // The series is counted in SQLite, one row per keyword and day, and only for the
       // keywords shown. The day boundaries come from JS: SQLite's 'localtime' reads the
       // zone once per process, while JS follows TZ, and JS steps whole calendar days
-      // across a DST change. Day n runs from bounds[n] up to bounds[n + 1].
-      const bounds = [...dayList.map((day) => sqlUtc(localMidnight(day)))];
-      const last = localMidnight(dayList[dayList.length - 1]);
-      bounds.push(sqlUtc(new Date(last.getFullYear(), last.getMonth(), last.getDate() + 1)));
+      // across a DST change. Day n is the pair ranges[n] = [start, stop).
       const seriesRows = db
         .prepare(
-          `WITH bounds AS (SELECT CAST(key AS INTEGER) AS n, value AS start FROM json_each(?)),
-                days AS (SELECT a.n, a.start, b.start AS stop FROM bounds a JOIN bounds b ON b.n = a.n + 1)
+          `WITH days AS (SELECT CAST(key AS INTEGER) AS n, json_extract(value, '$[0]') AS start, json_extract(value, '$[1]') AS stop
+                         FROM json_each(?))
            SELECT k.keyword, d.n AS day, COUNT(*) AS count
            FROM idea_keywords k
            JOIN ideas i ON i.id = k.idea_id
@@ -508,7 +507,7 @@ export function openDb(file: string) {
            WHERE i.created_at >= ? AND i.created_at < ? AND k.keyword IN (SELECT value FROM json_each(?))
            GROUP BY k.keyword, d.n`,
         )
-        .all(JSON.stringify(bounds), since, bounds[bounds.length - 1], JSON.stringify(rows.map((r) => r.keyword))) as any[];
+        .all(JSON.stringify(ranges), since, until, JSON.stringify(rows.map((r) => r.keyword))) as any[];
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
         if (!series.has(r.keyword)) series.set(r.keyword, dayList.map(() => 0));
@@ -760,6 +759,18 @@ export function localDays(days: number, now = new Date()) {
 function localMidnight(day: string) {
   const [y, m, d] = day.split('-').map(Number);
   return new Date(y, m - 1, d);
+}
+
+/**
+ * Each local day as its [start, stop) instants in SQLite's UTC format. A day stops
+ * where the next one starts, so a list of consecutive days leaves no gap and no
+ * overlap; across a DST change a day is 23 or 25 hours long.
+ */
+export function localDayRanges(dayList: string[]): [string, string][] {
+  return dayList.map((day) => {
+    const start = localMidnight(day);
+    return [sqlUtc(start), sqlUtc(new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1))];
+  });
 }
 
 /** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
