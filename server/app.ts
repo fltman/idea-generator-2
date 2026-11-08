@@ -8,7 +8,7 @@ import { extname, join, resolve, sep } from 'node:path';
 import { isIP } from 'node:net';
 import { hostname as osHostname } from 'node:os';
 import type { Repo, Idea, Board } from './db.ts';
-import { bracketed, unbracketed } from './hosts.ts';
+import { bracketed, isLoopbackHost, unbracketed } from './hosts.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
 import { PROVIDERS, keySource, listModels, mergeAppSettings, type AppSettings, type ProviderId } from './providers.ts';
@@ -242,11 +242,6 @@ export function machineNames(hostname: string): string[] {
   return [...new Set([full, label, `${label}.local`])];
 }
 
-/** localhost, *.localhost, 127.0.0.0/8 and [::1], as the hostname part of a hostKey. */
-function isLoopbackName(name: string) {
-  return name === 'localhost' || name.endsWith('.localhost') || name === '[::1]' || (isIP(name) === 4 && name.startsWith('127.'));
-}
-
 /** What to do about a reverse proxy, for the 403 and the start-up log. */
 export const PROXY_HINT =
   "Behind a reverse proxy, have it pass the browser's Host on (nginx: proxy_set_header Host $host;) and list the public name in ALLOWED_HOSTS.";
@@ -259,9 +254,9 @@ export const PROXY_HINT =
  * case gets the hint: a page from another local server (http://localhost:5173) is
  * simply not this app.
  */
-export function badOriginMessage(origin: string, from: string | null, host: string | undefined, sent = hostKey(host)) {
+export function badOriginMessage(origin: string, from: string | null, host: string | undefined, sent: string | null) {
   const base = `Requests from ${origin} are not accepted`;
-  if (!from || !sent || !isLoopbackName(hostnameOfKey(sent)) || isLoopbackName(hostnameOfKey(from))) return base;
+  if (!from || !sent || !isLoopbackHost(hostnameOfKey(sent)) || isLoopbackHost(hostnameOfKey(from))) return base;
   return `${base}: they reached the server with Host ${host}, a loopback name, so a reverse proxy probably rewrote it. ` +
     `Have the proxy pass the browser's Host on (nginx: proxy_set_header Host $host;) and list ${hostnameOfKey(from)} in ALLOWED_HOSTS.`;
 }

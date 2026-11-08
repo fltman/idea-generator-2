@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { bracketed, unbracketed } from '../server/hosts.ts';
+import { bracketed, isLoopbackHost, unbracketed } from '../server/hosts.ts';
 import { allowedHosts, isWildcard, parseAllowedHosts } from '../server/app.ts';
 import { assertPublicUrl } from '../server/extract.ts';
 
@@ -44,5 +44,22 @@ test('the two guards take their bracket handling from hosts.ts, not a copy of th
       .split('\n').filter((l) => !/console\.(error|log|warn)/.test(l)).join('\n'); // log prefixes like `[${req.method}` are not hosts
     assert.match(src, /from '\.\/hosts\.ts'/, `${file} imports hosts.ts`);
     for (const re of copies) assert.ok(!re.test(src), `${file} handles IPv6 brackets itself (${re}); use hosts.ts`);
+  }
+});
+
+test('isLoopbackHost: this machine by name or address, in any spelling', () => {
+  for (const h of ['localhost', 'LOCALHOST', 'localhost.', 'app.localhost', 'a.b.localhost', '127.0.0.1', '127.8.9.10', '127.255.255.255',
+                   '::1', '[::1]', '0:0:0:0:0:0:0:1', '[0:0::1]', '::ffff:127.0.0.1', '[::ffff:7f00:1]', ' localhost '])
+    assert.ok(isLoopbackHost(h), `${h} is this machine`);
+  for (const h of ['localhost.example.com', 'notlocalhost', 'localhostx', '128.0.0.1', '126.255.255.255', '10.0.0.1', '0.0.0.0', '::', '[::2]',
+                   '::ffff:10.0.0.1', 'ideas.example.com', '', 'fe80::1'])
+    assert.ok(!isLoopbackHost(h), `${h} is not this machine`);
+});
+
+test('both guards take "this machine" from hosts.ts, not a definition of their own', () => {
+  for (const file of ['app.ts', 'extract.ts']) {
+    const src = readFileSync(join(import.meta.dirname, '..', 'server', file), 'utf8');
+    assert.match(src, /isLoopbackHost/, `${file} uses isLoopbackHost`);
+    assert.doesNotMatch(src, /endsWith\(['"]\.localhost['"]\)|startsWith\(['"]127\./, `${file} has its own loopback test; use isLoopbackHost`);
   }
 });

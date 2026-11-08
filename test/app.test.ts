@@ -158,18 +158,18 @@ test('Host and Origin are compared in one normal form', async () => {
 });
 
 test('a refused write points to the proxy fix only when Host is loopback and the Origin is not', () => {
-  const hinted = (origin: string, host: string) => /reverse proxy/.test(badOriginMessage(origin, originKey(origin), host));
+  const hinted = (origin: string, host: string) => /reverse proxy/.test(badOriginMessage(origin, originKey(origin), host, hostKey(host)));
   // nginx's default proxy_pass: Host is the upstream, the Origin is the public page.
   for (const host of ['127.0.0.1:8300', 'localhost:8300', '[::1]:8300', '127.0.0.2:8300', 'app.localhost:8300', 'LOCALHOST:8300'])
     assert.ok(hinted('https://ideas.example.com', host), host);
-  assert.match(badOriginMessage('https://[2001:db8::5]', originKey('https://[2001:db8::5]'), '127.0.0.1:8300'), /list \[2001:db8::5\] in ALLOWED_HOSTS/);
+  assert.match(badOriginMessage('https://[2001:db8::5]', originKey('https://[2001:db8::5]'), '127.0.0.1:8300', hostKey('127.0.0.1:8300')), /list \[2001:db8::5\] in ALLOWED_HOSTS/);
   // Another local server, an opaque origin, a public Host, no Host: just refused.
   assert.ok(!hinted('http://localhost:5173', 'localhost:8300'), 'another local app');
   assert.ok(!hinted('http://127.0.0.1:8300', 'localhost:8300'), 'another of our loopback names');
   assert.ok(!hinted('null', '127.0.0.1:8300'), 'an opaque origin');
   assert.ok(!hinted('https://evil.example', 'ideas.example.com'), 'a public Host');
   assert.ok(!hinted('https://evil.example', ''), 'no Host');
-  assert.equal(badOriginMessage('https://evil.example', originKey('https://evil.example'), 'ideas.example.com'), 'Requests from https://evil.example are not accepted');
+  assert.equal(badOriginMessage('https://evil.example', originKey('https://evil.example'), 'ideas.example.com', hostKey('ideas.example.com')), 'Requests from https://evil.example are not accepted');
 });
 
 test('the start-up note says what a reverse proxy needs, with or without ALLOWED_HOSTS', () => {

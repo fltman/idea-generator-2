@@ -6,7 +6,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import type { LookupAddress } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
 import { Agent, fetch as undiciFetch } from 'undici';
-import { unbracketed } from './hosts.ts';
+import { isLoopbackHost, unbracketed } from './hosts.ts';
 
 const MAX_BYTES = 2_000_000;
 const MAX_CHARS = 6000;
@@ -107,7 +107,8 @@ export async function assertPublicUrl(url: URL, lookup: Lookup = realLookup, isR
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error(`Only http(s) links can be read (${url.protocol})`);
   const host = unbracketed(url.hostname).toLowerCase();
   const refuse = () => refusal(url.hostname);
-  if (host === 'localhost' || host.endsWith('.localhost')) throw refuse();
+  // A loopback name is refused without asking DNS. Addresses are judged by isRefused below.
+  if (!isIP(host) && isLoopbackHost(host)) throw refuse();
   if (isIP(host)) {
     if (isRefused(host)) throw refuse();
     return;
