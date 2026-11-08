@@ -9,8 +9,8 @@
     "node": ">=25"
   },
   "scripts": {
-    "start": "node --import ./server/require-node-25.js server/index.ts",
-    "dev": "node --import ./server/require-node-25.js --watch-path=server --watch-path=public/js/score.js --watch-path=public/js/evolve.js server/index.ts",
+    "start": "node server/require-node-25.js && node server/index.ts",
+    "dev": "node server/require-node-25.js && node --watch-path=server --watch-path=public/js/score.js --watch-path=public/js/evolve.js server/index.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "calibrate": "node tools/calibrate-judge.ts"
   },

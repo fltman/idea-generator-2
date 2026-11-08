@@ -1,5 +1,5 @@
-// The Node version guard. The one that counts is the --import preload in the npm
-// scripts: ESM loads and links every import of this file before running any of them,
+// The Node version guard. The one that counts is the npm scripts running it first,
+// as its own command: ESM loads and links every import of this file before running any of them,
 // so an import an older Node cannot load (a missing builtin, TypeScript it cannot
 // strip) fails before this line runs, and the message never shows. Imported here
 // as well, first, for `node server/index.ts` run by hand: there it helps only when

@@ -12,7 +12,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 
 ## Layout
 
-- `server/require-node-25.js` – stops an older Node with a clear message (plain JS, preloaded by `npm start` and `npm run dev`; that preload is the reliable guard, the import in `index.ts` only helps when the rest still loads).
+- `server/require-node-25.js` – stops an older Node with a clear message. `npm start` and `npm run dev` run it as its own command before the server (`node server/require-node-25.js && node …`), never with `--import`, which Node before 18.18 and 20.0 rejects. That first command is the reliable guard; the import in `index.ts` only helps when the rest still loads. Keep the file plain ES2015 with no `import`/`export`, so any Node can run it.
 - `server/hosts.ts` – IPv6 brackets on and off, shared by the Host/Origin guard (`app.ts`) and the private-address guard (`extract.ts`).
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
