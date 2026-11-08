@@ -209,7 +209,45 @@ export function machineNames(hostname: string): string[] {
   return [...new Set([full, label, `${label}.local`])];
 }
 
-function guardHost(req: IncomingMessage, isOurs: (port: number, sent: string, arrivedAt?: string) => boolean) {
+/** localhost, *.localhost, 127.0.0.0/8 and [::1], as the hostname part of a hostKey. */
+function isLoopbackName(name: string) {
+  return name === 'localhost' || name.endsWith('.localhost') || name === '[::1]' || (isIP(name) === 4 && name.startsWith('127.'));
+}
+
+/** What to do about a reverse proxy, for the 403 and the start-up log. */
+export const PROXY_HINT =
+  "Behind a reverse proxy, have it pass the browser's Host on (nginx: proxy_set_header Host $host;) and list the public name in ALLOWED_HOSTS.";
+
+/**
+ * Why a write was refused. A proxy that rewrites Host to its upstream (nginx's
+ * default proxy_pass sends Host: 127.0.0.1:8300) passes the Host guard, since that
+ * is a loopback name, but every write from the public page then fails here. When the
+ * Host is loopback and the Origin is not, say so and say what to change. No other
+ * case gets the hint: a page from another local server (http://localhost:5173) is
+ * simply not this app.
+ */
+export function badOriginMessage(origin: string, from: string | null, host: string | undefined) {
+  const base = `Requests from ${origin} are not accepted`;
+  const sent = hostKey(host);
+  if (!from || !sent || !isLoopbackName(hostnameOfKey(sent)) || isLoopbackName(hostnameOfKey(from))) return base;
+  return `${base}: they reached the server with Host ${host}, a loopback name, so a reverse proxy probably rewrote it. ` +
+    `Have the proxy pass the browser's Host on (nginx: proxy_set_header Host $host;) and list ${hostnameOfKey(from)} in ALLOWED_HOSTS.`;
+}
+
+/**
+ * The start-up note on Host names. A proxy cannot be detected at start-up, so the
+ * note says what a proxy needs whenever one could matter: always, worded for
+ * whether ALLOWED_HOSTS is set yet.
+ */
+export function hostNote(allowedHostList: string | undefined): string {
+  const { names, keys } = parseAllowedHosts(allowedHostList);
+  const listed = [...names, ...keys];
+  if (!listed.length) return PROXY_HINT;
+  return `Also answering to ALLOWED_HOSTS: ${listed.join(', ')}. A reverse proxy must pass the browser's Host on ` +
+    '(nginx: proxy_set_header Host $host;), or writes from the browser are refused (403 bad_origin).';
+}
+
+function guardHost(req: IncomingMessage, isOurs:(port: number, sent: string, arrivedAt?: string) => boolean) {
   const port = req.socket.localPort;
   const arrivedAt = req.socket.localAddress;
   const sent = hostKeys(req.headers.host); // a portless Host also matches an ALLOWED_HOSTS name:443
@@ -238,7 +276,7 @@ function guardMutation(req: IncomingMessage) {
   const origin = req.headers.origin;
   if (origin !== undefined) {
     const from = originKey(origin); // null for "null" or junk: not us
-    if (!from || !hostKeys(req.headers.host).includes(from)) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
+    if (!from || !hostKeys(req.headers.host).includes(from)) throw new AppError(403, 'bad_origin', badOriginMessage(origin, from, req.headers.host));
   }
   if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
     throw new AppError(415, 'bad_content_type', 'Send the body as application/json');

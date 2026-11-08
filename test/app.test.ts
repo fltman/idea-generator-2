@@ -8,7 +8,10 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, arrivalKey, createHandler, hostGuard, hostKey, hostKeys, isWildcard, machineNames, originKey, parseAllowedHosts } from '../server/app.ts';
+import {
+  allowedHosts, arrivalKey, badOriginMessage, createHandler, hostGuard, hostKey, hostKeys, hostNote, isWildcard, machineNames, originKey,
+  parseAllowedHosts, PROXY_HINT,
+} from '../server/app.ts';
 import { connect } from 'node:net';
 import { hostname, networkInterfaces } from 'node:os';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
@@ -70,7 +73,7 @@ test('a page on another site cannot change settings or boards; the app itself an
 
 // fetch() will not let us lie about Host, so this goes through node:http directly.
 function withHost(port: number, host: string, method = 'GET', path = '/api/boards', body?: string, extra: Record<string, string> = {}, address = '127.0.0.1') {
-  return new Promise<{ status: number; code?: string }>((done, fail) => {
+  return new Promise<{ status: number; code?: string; error?: string }>((done, fail) => {
     const headers: Record<string, string> = { Host: host, ...extra };
     if (body) headers['Content-Type'] = 'application/json';
     const r = request({ host: address, port, method, path, headers }, (res) => {
@@ -78,8 +81,9 @@ function withHost(port: number, host: string, method = 'GET', path = '/api/board
       res.on('data', (c) => (raw += c));
       res.on('end', () => {
         let code: string | undefined;
-        try { code = JSON.parse(raw).code; } catch { /* static file */ }
-        done({ status: res.statusCode!, code });
+        let error: string | undefined;
+        try { ({ code, error } = JSON.parse(raw)); } catch { /* static file */ }
+        done({ status: res.statusCode!, code, error });
       });
     });
     r.on('error', fail);
@@ -151,6 +155,31 @@ test('Host and Origin are compared in one normal form', async () => {
   const elsewhere = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://localhost:${port + 1}` });
   assert.equal(elsewhere.status, 403, 'our name on another port is another app');
   assert.equal(elsewhere.code, 'bad_origin');
+});
+
+test('a refused write points to the proxy fix only when Host is loopback and the Origin is not', () => {
+  const hinted = (origin: string, host: string) => /reverse proxy/.test(badOriginMessage(origin, originKey(origin), host));
+  // nginx's default proxy_pass: Host is the upstream, the Origin is the public page.
+  for (const host of ['127.0.0.1:8300', 'localhost:8300', '[::1]:8300', '127.0.0.2:8300', 'app.localhost:8300', 'LOCALHOST:8300'])
+    assert.ok(hinted('https://ideas.example.com', host), host);
+  assert.match(badOriginMessage('https://[2001:db8::5]', originKey('https://[2001:db8::5]'), '127.0.0.1:8300'), /list \[2001:db8::5\] in ALLOWED_HOSTS/);
+  // Another local server, an opaque origin, a public Host, no Host: just refused.
+  assert.ok(!hinted('http://localhost:5173', 'localhost:8300'), 'another local app');
+  assert.ok(!hinted('http://127.0.0.1:8300', 'localhost:8300'), 'another of our loopback names');
+  assert.ok(!hinted('null', '127.0.0.1:8300'), 'an opaque origin');
+  assert.ok(!hinted('https://evil.example', 'ideas.example.com'), 'a public Host');
+  assert.ok(!hinted('https://evil.example', ''), 'no Host');
+  assert.equal(badOriginMessage('https://evil.example', originKey('https://evil.example'), 'ideas.example.com'), 'Requests from https://evil.example are not accepted');
+});
+
+test('the start-up note says what a reverse proxy needs, with or without ALLOWED_HOSTS', () => {
+  assert.equal(hostNote(undefined), PROXY_HINT);
+  assert.equal(hostNote(''), PROXY_HINT);
+  assert.match(PROXY_HINT, /proxy_set_header Host \$host;.*ALLOWED_HOSTS/);
+  const set = hostNote('ideas.example.com, box:8443');
+  assert.match(set, /ALLOWED_HOSTS: ideas\.example\.com, box:8443\./);
+  assert.match(set, /proxy_set_header Host \$host;/);
+  assert.match(set, /403 bad_origin/);
 });
 
 test('the loopback and HOST names are per port', () => {
@@ -298,6 +327,12 @@ test('behind a TLS proxy: name:443 matches the portless Host, and the https Orig
       const upstream = await write(`127.0.0.1:${port}`, 'https://ideas.example.com');
       assert.equal(upstream.status, 403);
       assert.equal(upstream.code, 'bad_origin');
+      // ...and the refusal says so, with what to change.
+      assert.match(upstream.error!, /reverse proxy probably rewrote it/);
+      assert.match(upstream.error!, /proxy_set_header Host \$host;/);
+      assert.match(upstream.error!, /list ideas\.example\.com in ALLOWED_HOSTS/);
+      // A plain cross-site refusal gets no proxy hint.
+      assert.doesNotMatch((await write('ideas.example.com', 'https://evil.example')).error!, /proxy/);
     }
     // name:443 is that port only: a Host that names port 80 is not it.
     const [only443] = servers;
