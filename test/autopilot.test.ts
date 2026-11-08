@@ -156,3 +156,54 @@ test('autoStep with the real engine: judge first, grow a small pool, then breed'
   assert.ok(ideas.every((i) => i.judgedAt), 'every step leaves its ideas judged');
   assert.ok(ideas.some((i) => i.kind === 'combine' && i.generation >= 2));
 });
+
+test('scheduler: switching a board to manual and back neither doubles a running step nor resets its limits', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let started = 0;
+  let running = 0;
+  let release!: () => void;
+  const slow = {
+    ...engine,
+    autoStep: () => {
+      started++;
+      running++;
+      return new Promise<{ did: 'combine' }>((r) => { release = () => { running--; r({ did: 'combine' }); }; });
+    },
+  };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'Toggle', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 1, usdPerDay: 100 } } });
+  const mode = (id: number, m: 'auto' | 'manual') => repo.updateBoard(id, { config: { mode: m } });
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+
+  await ap.tick();
+  assert.equal(started, 1);
+  mode(board.id, 'manual'); await ap.tick();
+  mode(board.id, 'auto'); now += 1_000; await ap.tick();
+  assert.equal(started, 1, 'no second step beside the one still running');
+  assert.equal(running, 1);
+  assert.equal(ap.status(board.id).state, 'running');
+  release(); await flush();
+
+  // That step used the hour's one step, and a round trip through manual does not hand it back.
+  mode(board.id, 'manual'); await ap.tick();
+  assert.equal(ap.status(board.id).state, 'manual');
+  mode(board.id, 'auto'); now += 60_000; await ap.tick(); await flush();
+  assert.equal(started, 1);
+  assert.equal(ap.status(board.id).state, 'hourly');
+
+  // The error backoff survives a toggle too.
+  mode(board.id, 'manual');
+  const failing = fakeEngineFor(repo);
+  failing.setFail(true);
+  const ap2 = createAutopilot({ repo, engine: failing.engine, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const other = repo.createBoard({ title: 'Fails', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap2.tick(); await flush();
+  assert.equal(ap2.status(other.id).state, 'error');
+  failing.setFail(false);
+  mode(other.id, 'manual'); await ap2.tick();
+  mode(other.id, 'auto'); now += 15_000; await ap2.tick(); await flush();
+  assert.equal(ap2.status(other.id).state, 'backoff', 'still backing off');
+  assert.equal(failing.steps.length, 0);
+});

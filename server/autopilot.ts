@@ -86,12 +86,18 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
     const t = now();
     const globalSpent = repo.spentOn(null);
     const boards = repo.listBoards();
-    // A deleted board is gone from the list: forget its state, or the map grows with every board ever made.
+    // A deleted board is gone from the list: forget its state, or the map grows with every
+    // board ever made. Not while its step still runs, though: that step's result lands in it.
     const alive = new Set(boards.map((b) => b.id));
-    for (const id of states.keys()) if (!alive.has(id)) states.delete(id);
+    for (const [id, s] of states) if (!alive.has(id) && !s.busy) states.delete(id);
     for (const b of boards) {
       if (b.config.mode !== 'auto') {
-        if (states.delete(b.id)) engine.bus.emit(b.id, { type: 'autopilot', status: { state: 'manual' } });
+        // Keep the state of a board taken off auto: a step may still be running, and its
+        // hour of steps and its error backoff must still count if it is switched back on.
+        // Forgetting them would let a manual-auto toggle start a second step beside the
+        // first, or skip the hourly limit and the backoff.
+        const s = states.get(b.id);
+        if (s && !s.busy) publish(b.id, s, { state: 'manual' });
         continue;
       }
       let s = states.get(b.id);

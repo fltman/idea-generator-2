@@ -42,7 +42,7 @@ Needs Node 25 or newer, which runs TypeScript directly. There is no build step.
 ```bash
 npm install          # one dependency: @anthropic-ai/sdk
 npm start            # http://localhost:8300
-npm test             # 70 tests, fake LLM, no network
+npm test             # 73 tests, fake LLM, no network
 npm run calibrate    # real judge vs. reference ideas (~$0.07); -- --model ollama:qwen3:8b for others
 ```
 
@@ -53,11 +53,11 @@ The server reads its own settings from the environment:
 | Variable | Default | What it does |
 |---|---|---|
 | `PORT` | `8300` | The port to listen on. |
-| `HOST` | `127.0.0.1` | The address to listen on. `HOST=0.0.0.0` (or `::`) listens on every interface and also answers to this machine's own addresses, so a tablet or a second screen on your network can open `http://192.168.1.20:8300`. Addresses that appear later, from Wi-Fi or a VPN, work without a restart. |
+| `HOST` | `127.0.0.1` | The address to listen on. `HOST=0.0.0.0` (or `::`) listens on every interface and also answers to this machine's own addresses, so a tablet or a second screen on your network can open `http://192.168.1.20:8300`. Addresses that appear later, from Wi-Fi or a VPN, work within a few seconds, without a restart. |
 | `ALLOWED_HOSTS` | none | More names the server answers to, separated by commas. A bare name works on any port, for a port forward or a proxy: `ALLOWED_HOSTS=localhost` with `ssh -L 9000:localhost:8300`. A `name:port` entry works on that port only. A malformed entry stops the server at start-up. |
 | `DB_FILE` | `data/ideas.db` | Where the SQLite database lives. |
 
-The server only answers requests addressed to one of its own names: `localhost`, `127.0.0.1` and `[::1]` on its port, plus what `HOST` and `ALLOWED_HOSTS` add. That stops DNS rebinding, where a web page points its own domain at your machine to read the app.
+The server only answers requests addressed to one of its own names: `localhost`, `127.0.0.1` and `[::1]` on its port, plus what `HOST` and `ALLOWED_HOSTS` add. That stops DNS rebinding, where a web page points its own domain at your machine to read the app. Changes (POST, PUT, PATCH, DELETE) from a browser must also come from a page on one of those names, so behind an HTTPS proxy `https://ideas.example.com` works once `ALLOWED_HOSTS` lists `ideas.example.com`.
 
 By default the server listens on 127.0.0.1 only. There is no login, and keys pass through it, so **do not expose it** as is. With `HOST=0.0.0.0`, anyone on your network can use the app and the keys in it.
 

@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
-import { allowedHosts, createHandler, hostGuard, hostKey, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
+import { allowedHosts, createHandler, hostGuard, hostKey, INTERFACE_REFRESH_MS, isWildcard, originKey, parseAllowedHosts } from '../server/app.ts';
 import { DEFAULT_APP_SETTINGS, type AppSettings } from '../server/providers.ts';
 
 let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
@@ -144,8 +144,10 @@ test('Host and Origin are compared in one normal form', async () => {
   const ipv6 = await withHost(port, `[0:0:0:0:0:0:0:1]:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://[::1]:${port}` });
   assert.equal(ipv6.status, 200, 'same IPv6 address, spelled two ways');
   const other = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://127.0.0.1:${port}` });
-  assert.equal(other.status, 403, 'another of our names is still another origin');
-  assert.equal(other.code, 'bad_origin');
+  assert.equal(other.status, 200, 'another of our own names is still us');
+  const elsewhere = await withHost(port, `localhost:${port}`, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: `http://localhost:${port + 1}` });
+  assert.equal(elsewhere.status, 403, 'our name on another port is another app');
+  assert.equal(elsewhere.code, 'bad_origin');
 });
 
 test('the loopback and HOST names are built once per port, then reused', () => {
@@ -173,7 +175,8 @@ test('HOST=0.0.0.0 or :: answers to this machine\'s interface addresses, and not
   for (const n of ['127.0.0.1', '::1', 'ideas.lan', '10.0.0.0']) assert.ok(!isWildcard(n), n);
 
   const addresses = ['192.168.1.20', 'fe80::1%eth0'];
-  const isOurs = hostGuard({ host: '0.0.0.0', interfaces: fakeInterfaces(addresses) });
+  let now = 0;
+  const isOurs = hostGuard({ host: '0.0.0.0', interfaces: fakeInterfaces(addresses), now: () => now });
   assert.ok(isOurs(8300, '192.168.1.20:8300'), 'the LAN address');
   assert.ok(isOurs(8300, hostKey('[fe80::1]:8300')!), 'link-local IPv6, zone id dropped');
   assert.ok(isOurs(8300, 'localhost:8300'), 'loopback names still work');
@@ -183,6 +186,7 @@ test('HOST=0.0.0.0 or :: answers to this machine\'s interface addresses, and not
   assert.ok(!isOurs(8300, '0.0.0.0:8300'), 'the wildcard is a bind, not an address');
 
   addresses.push('10.8.0.2'); // a VPN came up after start
+  now += INTERFACE_REFRESH_MS;
   assert.ok(isOurs(8300, '10.8.0.2:8300'), 'looked up again before refusing');
 
   const v6 = hostGuard({ host: '::', interfaces: fakeInterfaces(['192.168.1.20']) });
@@ -232,5 +236,54 @@ test('end to end: a port-forwarded browser and a LAN device both get the app', a
   } finally {
     forwarded.s.close();
     lan.s.close();
+  }
+});
+
+test('a wildcard bind looks its interfaces up again at most every few seconds', () => {
+  let now = 1_000_000;
+  let lookups = 0;
+  const addresses = ['192.168.1.20'];
+  const fake = fakeInterfaces(addresses);
+  const isOurs = hostGuard({ host: '0.0.0.0', interfaces: () => { lookups++; return fake(); }, now: () => now });
+
+  assert.ok(isOurs(8300, '192.168.1.20:8300'));
+  assert.equal(lookups, 1, 'one lookup to build the set');
+  for (let n = 0; n < 1000; n++) assert.ok(!isOurs(8300, `evil${n}.example:8300`));
+  assert.equal(lookups, 1, 'a flood of refused hosts right after does not look again');
+
+  now += INTERFACE_REFRESH_MS;
+  for (let n = 0; n < 1000; n++) assert.ok(!isOurs(8300, `evil${n}.example:8300`));
+  assert.equal(lookups, 2, 'one more lookup once the interval has passed, then none');
+
+  addresses.push('10.8.0.2'); // a VPN comes up
+  assert.ok(!isOurs(8300, '10.8.0.2:8300'), 'not yet: the last lookup was just now');
+  now += INTERFACE_REFRESH_MS;
+  assert.ok(isOurs(8300, '10.8.0.2:8300'), 'seen within a few seconds');
+  assert.equal(lookups, 3);
+  assert.ok(isOurs(8300, '10.8.0.2:8300') && isOurs(8300, '192.168.1.20:8300'));
+  assert.equal(lookups, 3, 'known hosts never trigger a lookup');
+});
+
+test('behind a TLS proxy the Origin is checked against our names, not the Host header', async () => {
+  const s = createServer(createHandler({
+    repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public'), allowedHostList: 'ideas.example.com',
+  }));
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+  const port = (s.address() as any).port as number;
+  try {
+    const json = { 'Content-Type': 'application/json' };
+    const write = (host: string, origin: string) => withHost(port, host, 'POST', '/api/boards', '{"lang":"sv"}', { ...json, Origin: origin });
+    // nginx with proxy_set_header Host $host: Host has no port (80), the page is https (443).
+    assert.equal((await write('ideas.example.com', 'https://ideas.example.com')).status, 200, 'Host $host');
+    // nginx's default: Host is the upstream address.
+    assert.equal((await write(`127.0.0.1:${port}`, 'https://ideas.example.com')).status, 200, 'Host rewritten to the upstream');
+    // Another site is refused however the proxy rewrites Host.
+    for (const origin of ['https://evil.example', 'https://ideas.example.com.evil.example', 'null']) {
+      const r = await write('ideas.example.com', origin);
+      assert.equal(r.status, 403, origin);
+      assert.equal(r.code, 'bad_origin');
+    }
+  } finally {
+    s.close();
   }
 });

@@ -31,6 +31,8 @@ type Deps = {
   allowedHostList?: string;
   /** Interface lister, os.networkInterfaces unless a test passes its own. */
   interfaces?: () => ReturnType<typeof networkInterfaces>;
+  /** Clock for the interface refresh, Date.now unless a test passes its own. */
+  now?: () => number;
 };
 
 const TYPES: Record<string, string> = {
@@ -147,25 +149,34 @@ export function parseAllowedHosts(list: string | undefined) {
   return { names, keys };
 }
 
+/** How often a wildcard bind may look its interface addresses up again. */
+export const INTERFACE_REFRESH_MS = 5_000;
+
 /**
- * Decides whether a Host (in hostKey form) is ours, for a request that came in on `port`.
- * The loopback and HOST names are built once per port. On a wildcard bind the
- * interface addresses are looked up again before refusing, since DHCP, Wi-Fi and
- * VPNs change them while the server runs.
+ * Decides whether a host (in hostKey form) is ours, for a request that came in on `port`.
+ * The Host guard and the Origin guard both ask it. The loopback and HOST names are
+ * built once per port. On a wildcard bind an unknown host makes it look the interface
+ * addresses up again, since DHCP, Wi-Fi and VPNs change them while the server runs,
+ * but at most every INTERFACE_REFRESH_MS: refused requests are the attacker's to
+ * send, and each lookup is a system call and a rebuilt set.
  */
-export function hostGuard(opts: { host?: string; allowedHostList?: string; interfaces?: () => ReturnType<typeof networkInterfaces> } = {}) {
+export function hostGuard(opts: {
+  host?: string; allowedHostList?: string; interfaces?: () => ReturnType<typeof networkInterfaces>; now?: () => number;
+} = {}) {
   const extra = parseAllowedHosts(opts.allowedHostList);
   const wildcard = !!opts.host && isWildcard(opts.host);
-  const cache = new Map<number, Set<string>>();
+  const now = opts.now ?? Date.now;
+  const cache = new Map<number, { set: Set<string>; at: number }>();
   const build = (port: number) => {
-    const set = allowedHosts(port, opts.host, opts.interfaces);
-    cache.set(port, set);
-    return set;
+    const entry = { set: allowedHosts(port, opts.host, opts.interfaces), at: now() };
+    cache.set(port, entry);
+    return entry;
   };
   return (port: number, sent: string): boolean => {
     if (extra.keys.has(sent) || extra.names.has(hostnameOfKey(sent))) return true;
-    if ((cache.get(port) ?? build(port)).has(sent)) return true;
-    return wildcard && build(port).has(sent);
+    const entry = cache.get(port) ?? build(port);
+    if (entry.set.has(sent)) return true;
+    return wildcard && now() - entry.at >= INTERFACE_REFRESH_MS && build(port).set.has(sent);
   };
 }
 
@@ -180,17 +191,22 @@ function guardHost(req: IncomingMessage, isOurs: (port: number, sent: string) =>
  * browser POST here (loopback is no protection against the user's own browser),
  * and could repoint a provider URL to itself to collect the API keys, or move the
  * projects folder. Browsers send Origin on every request that is not GET/HEAD,
- * so an Origin that is not this server is refused; a request without Origin comes
- * from a non-browser client such as a shell script or the tests. Bodies must be
- * JSON: a cross-site form or fetch can only send text/plain without a CORS preflight.
+ * so an Origin that is not one of this server's names is refused; a request without
+ * Origin comes from a non-browser client such as a shell script or the tests. Bodies
+ * must be JSON: a cross-site form or fetch can only send text/plain without a CORS preflight.
+ *
+ * The Origin is checked against the same names as Host, not against the Host header
+ * itself: behind a TLS proxy the browser's Origin is https://name (port 443) while
+ * Host says name (port 80) or the proxy's upstream, 127.0.0.1:8300.
  */
-function guardMutation(req: IncomingMessage) {
+function guardMutation(req: IncomingMessage, isOurs: (port: number, sent: string) => boolean) {
   const method = req.method ?? 'GET';
   if (method === 'GET' || method === 'HEAD') return;
   const origin = req.headers.origin;
   if (origin !== undefined) {
     const from = originKey(origin); // null for "null" or junk: not us
-    if (!from || from !== hostKey(req.headers.host)) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
+    const port = req.socket.localPort;
+    if (!from || !port || !isOurs(port, from)) throw new AppError(403, 'bad_origin', `Requests from ${origin} are not accepted`);
   }
   if (method !== 'DELETE' && !/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
     throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
@@ -308,9 +324,9 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir, host, allowedHostList, interfaces }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, publicDir, host, allowedHostList, interfaces, now }: Deps) {
   const root = resolve(publicDir);
-  const isOurs = hostGuard({ host, allowedHostList, interfaces });
+  const isOurs = hostGuard({ host, allowedHostList, interfaces, now });
 
   function providerStatus() {
     const s = runtime.get();
@@ -476,7 +492,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
       }
-      guardMutation(req);
+      guardMutation(req, isOurs);
       const ev = url.pathname.match(/^\/api\/boards\/(\d+)\/events$/);
       if (ev && req.method === 'GET') return events(+ev[1], req, res);
       for (const [method, re, fn] of routes) {
