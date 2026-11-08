@@ -4,6 +4,7 @@
 // its jury guidance, its researchers, its autopilot pace. Templates only seed
 // a new board's flow; editing a board never changes another board.
 import { DatabaseSync } from 'node:sqlite';
+import { medal, scoreSum } from '../public/js/score.js';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS templates (
@@ -658,12 +659,9 @@ export function openDb(file: string) {
       const recentIds = new Set(
         (db.prepare(`SELECT id FROM ideas WHERE created_at >= datetime('now', ?)`).all(since) as any[]).map((r) => r.id),
       );
-      const sum = (i: Idea) => (i.originality == null ? null : i.originality + i.feasibility! + i.impact!);
-      const medalOf = (i: Idea) => {
-        if (i.medalOverride != null) return i.medalOverride;
-        const s = sum(i);
-        return s == null ? null : s >= 13 ? 3 : s >= 11 ? 2 : s >= 9 ? 1 : 0;
-      };
+      // The medal is the one the rest of the app shows: score.js decides the thresholds, and a hand-set medal wins.
+      const sum = (i: Idea): number | null => scoreSum(i);
+      const medalOf = (i: Idea): number | null => medal(i);
       const rank = (x: Idea, y: Idea) => (sum(y) ?? -1) - (sum(x) ?? -1) || y.id - x.id;
       const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: sum(i), medal: medalOf(i), reason: i.reason, kind: i.kind });
       const title = new Map(boards.map((b) => [b.id, b.title]));
