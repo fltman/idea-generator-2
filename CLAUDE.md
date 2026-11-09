@@ -13,7 +13,10 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 ## Layout
 
 - `server/require-node-25.js` – stops an older Node with a clear message. `npm start` and `npm run dev` run it as its own command before the server (`node server/require-node-25.js && node …`), never with `--import`, which Node before 18.18 and 20.0 rejects. That first command is the reliable guard; the import in `index.ts` only helps when the rest still loads. Keep the file plain ES2015 with no `import`/`export`, so any Node can run it.
-- `server/hosts.ts` – IPv6 brackets on and off, shared by the Host/Origin guard (`app.ts`) and the private-address guard (`extract.ts`).
+- `server/hosts.ts` – the one place for host and address parsing, shared by the Host/Origin guard (`app.ts`) and the private-address guard (`extract.ts`). Don't add a local copy of any of these elsewhere (tests check it):
+  - IPv6 brackets on and off (`bracketed`, `unbracketed`);
+  - the IPv6 parser (`ipv6Groups`) and `unmappedIPv4`, which turns an IPv4-mapped address (dotted or hex) back into IPv4;
+  - `isLoopbackHost`, for `localhost`, `*.localhost`, 127.0.0.0/8 and `::1`.
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
   - Anthropic uses the official SDK with `output_config.format`.
