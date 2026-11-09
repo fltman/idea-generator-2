@@ -160,7 +160,19 @@ function onEvent(e) {
     case 'error':
       fail(e);
       break;
+    case 'deleted':
+      // Deleted in another window (this one stops following before it deletes).
+      if (S.board?.id === e.boardId) leaveDeletedBoard(S.board.title).catch(fail);
+      break;
   }
+}
+
+async function leaveDeletedBoard(title) {
+  S.stopFollow = null;
+  toast(t('boardDeleted', { t: title }), 'error', 8000);
+  await loadBoards();
+  if (S.boards.length) await openBoard(S.boards[0].id);
+  else { S.board = null; await newBoardDialog(true); }
 }
 
 // ================================================================ actions
@@ -680,7 +692,9 @@ async function boardSettingsDialog() {
       onclick: async () => {
         if (!confirm(t('confirmDeleteBoard', { t: b.title }))) return;
         try {
-          await api('DELETE', `/api/boards/${b.id}`);
+          if (S.board?.id === b.id) { S.stopFollow?.(); S.stopFollow = null; } // its 'deleted' event is for other windows
+          try { await api('DELETE', `/api/boards/${b.id}`); }
+          catch (e) { if (S.board?.id === b.id) S.stopFollow = follow(b.id, onEvent); throw e; }
           dlg.close();
           await loadBoards();
           if (S.boards.length) await openBoard(S.boards[0].id);

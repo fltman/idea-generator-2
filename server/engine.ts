@@ -33,6 +33,10 @@ export function createBus() {
       subs.get(boardId)!.add(fn);
       return () => subs.get(boardId)?.delete(fn);
     },
+    /** Forget every listener of a board (deleted: its id can go to the next board). */
+    drop(boardId: number) {
+      subs.delete(boardId);
+    },
     emit(boardId: number, e: BoardEvent) {
       for (const fn of subs.get(boardId) ?? []) {
         try {
@@ -386,7 +390,12 @@ export function createEngine(deps: Deps) {
       // Its ideas are gone: a judgement still running for one must not make the next
       // idea that gets its id look busy (it would be skipped by the queue and the autopilot).
       for (const [id, j] of judging) if (j.boardId === boardId) judging.delete(id);
-      return repo.deleteBoard(boardId);
+      const deleted = repo.deleteBoard(boardId);
+      // Pages still open on it hear that it is gone, then stop hearing this id at all:
+      // the next board created gets the same id, and its events are not theirs.
+      if (deleted) bus.emit(boardId, { type: 'deleted', boardId });
+      bus.drop(boardId);
+      return deleted;
     },
 
     async reveal(ideaId: number) {

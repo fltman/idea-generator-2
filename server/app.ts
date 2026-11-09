@@ -563,14 +563,19 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
   function events(boardId: number, req: IncomingMessage, res: ServerResponse) {
     if (!repo.getBoard(boardId)) return send(res, 404, { error: 'Board not found' });
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-    const write = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
+    const write = (e: any) => {
+      res.write(`data: ${JSON.stringify(e)}\n\n`);
+      if (e?.type === 'deleted') stop(); // the bus has dropped us; end the stream too (the page closes its EventSource)
+    };
     write({ type: 'hello', autopilot: autopilot.status(boardId), settingsReceived: runtime.received() });
     const off = engine.bus.on(boardId, write);
     const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
-    req.on('close', () => {
+    function stop() {
       off();
       clearInterval(ping);
-    });
+      res.end();
+    }
+    req.on('close', stop);
   }
 
   async function serveStatic(pathname: string, res: ServerResponse) {

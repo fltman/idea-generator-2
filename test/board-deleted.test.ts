@@ -240,3 +240,25 @@ test('a project folder write that fails after the board was deleted is board_del
   assert.deepEqual(events, [], 'the old idea is not published on the new board');
   assert.equal(repo.getIdea(own.id)!.projectPath, null);
 });
+
+test('deleteBoard tells the board\'s listeners it is gone, then drops them: the next board with that id is not theirs', async () => {
+  const repo = openDb(':memory:');
+  const engine = createEngine({ repo, chat: async () => { throw new Error('no model'); }, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
+  const old = repo.createBoard({ title: 'Gammal' });
+  const stale: any[] = [];
+  engine.bus.on(old.id, (e: any) => stale.push(e));
+  assert.equal(engine.deleteBoard(old.id), true);
+  assert.deepEqual(stale, [{ type: 'deleted', boardId: old.id }]);
+
+  const next = repo.createBoard({ title: 'Ny' });
+  assert.equal(next.id, old.id);
+  const fresh: any[] = [];
+  engine.bus.on(next.id, (e: any) => fresh.push(e));
+  await engine.seed(next.id, { text: 'Sjungande bänk' });
+  await engine.idle();
+  assert.ok(fresh.some((e) => e.type === 'ideas'), 'the new board\'s own listener hears it');
+  assert.deepEqual(stale, [{ type: 'deleted', boardId: old.id }], 'the old page hears nothing of the new board');
+
+  assert.equal(engine.deleteBoard(old.id + 100), false);
+  assert.deepEqual(fresh.filter((e) => e.type === 'deleted'), [], 'no deleted event for a board that did not exist');
+});

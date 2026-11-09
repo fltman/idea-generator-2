@@ -378,6 +378,39 @@ test('live events: a browser following a board sees what happens', async () => {
   assert.ok(types.includes('ideas') && types.includes('judging'), types.join(','));
 });
 
+test('live events: a page open on a deleted board hears "deleted", then its stream ends', async () => {
+  const board = await newBoard();
+  const res = await fetch(`${base}/api/boards/${board.id}/events`);
+  const reader = res.body!.getReader();
+  const seen: any[] = [];
+  const dec = new TextDecoder();
+  const pump = (async () => {
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return 'ended';
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        if (chunk.startsWith('data: ')) seen.push(JSON.parse(chunk.slice(6)));
+      }
+    }
+  })();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await api('DELETE', `/api/boards/${board.id}`)).status, 200);
+  const timeout = new Promise((r) => setTimeout(() => r('still open'), 2000));
+  assert.equal(await Promise.race([pump, timeout]), 'ended', 'the server ends the stream');
+  assert.deepEqual(seen.map((e) => e.type), ['hello', 'deleted']);
+  assert.equal(seen[1].boardId, board.id);
+  const next = await newBoard();
+  assert.equal(next.id, board.id, 'the next board gets the id');
+  await seed(next.id, 'Ny');
+  await engine.idle();
+  assert.deepEqual(seen.map((e) => e.type), ['hello', 'deleted'], 'nothing of the new board reached the old page');
+});
+
 test('provider failures surface with their code, and nothing is half-saved', async () => {
   const board = await newBoard();
   const s = await seed(board.id, 'Frö');

@@ -77,7 +77,7 @@ const DICT = {
     models: 'Modeller', modelsBoardNote: 'Tomt fält = appens inställning.',
     role_distill: 'Destillera frö', role_expand: 'Förgrena', role_combine: 'Korsa', role_judge: 'Jury', role_summary: 'Sammanfatta',
     role_research: 'Forskningsspanare', role_x: 'X-spanare', role_brief: 'Projektbrief',
-    deleteBoard: 'Radera tavlan', confirmDeleteBoard: 'Radera tavlan "{t}" med alla idéer?',
+    deleteBoard: 'Radera tavlan', confirmDeleteBoard: 'Radera tavlan "{t}" med alla idéer?', boardDeleted: 'Tavlan "{t}" raderades i ett annat fönster',
     // app settings
     providers: 'Leverantörer', apiKey: 'API-nyckel', baseUrl: 'Adress', test: 'Testa', testOk: '{n} modeller', keyFrom_browser: 'nyckel här',
     keyFrom_env: 'nyckel från miljön', keyMissing: 'ingen nyckel', local: 'lokal',
@@ -177,7 +177,7 @@ const DICT = {
     models: 'Models', modelsBoardNote: 'Empty field = the app setting.',
     role_distill: 'Distill seed', role_expand: 'Branch', role_combine: 'Cross', role_judge: 'Jury', role_summary: 'Summarize',
     role_research: 'Research scout', role_x: 'X scout', role_brief: 'Project brief',
-    deleteBoard: 'Delete board', confirmDeleteBoard: 'Delete the board "{t}" with all its ideas?',
+    deleteBoard: 'Delete board', confirmDeleteBoard: 'Delete the board "{t}" with all its ideas?', boardDeleted: 'The board "{t}" was deleted in another window',
     providers: 'Providers', apiKey: 'API key', baseUrl: 'Address', test: 'Test', testOk: '{n} models', keyFrom_browser: 'key here',
     keyFrom_env: 'key from environment', keyMissing: 'no key', local: 'local',
     projectsRoot: 'Folder for Claude Code projects', globalBudget: 'Global limit, USD per day', spend: 'Spent: ${today} today · ${total} in total',
