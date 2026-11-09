@@ -281,3 +281,5 @@ body.exhibit #seed-input { font-size: 20px; padding: 18px 22px; }
   .bar-right .btn.ghost { padding: 6px 8px; }
   .dash-body { grid-template-columns: 1fr; }
 }
+
+#chatgpt-usage { position: absolute; bottom: 78px; left: 50%; transform: translateX(-50%); padding: 4px 10px; border-radius: 8px; background: var(--bg, #181b22); }

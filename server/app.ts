@@ -2,6 +2,8 @@
 // createHandler() takes its dependencies so the tests can run it against an
 // in-memory database and a fake LLM.
 
+import { ChatGPTError, type ChatGPT } from './chatgpt.ts';
+import { localRequest } from './local-request.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
@@ -18,7 +20,7 @@ export type Runtime = {
   received(): boolean;
 };
 
-type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string };
+type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string; chatgpt?: ChatGPT };
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -52,7 +54,7 @@ async function readJson(req: IncomingMessage): Promise<any> {
 
 function send(res: ServerResponse, status: number, body: unknown, type = 'application/json; charset=utf-8') {
   const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
-  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+  res.writeHead(status, { 'Content-Type': type, 'Cache-Control': res.getHeader('Cache-Control') ?? 'no-cache' });
   res.end(payload);
 }
 
@@ -162,7 +164,7 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, publicDir, chatgpt }: Deps) {
   const root = resolve(publicDir);
 
   function providerStatus() {
@@ -190,7 +192,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
     ['POST', /^\/api\/providers\/([a-z]+)\/models$/, async ([id]) => {
       if (!(id in PROVIDERS)) throw new AppError(404, 'not_found', 'Unknown provider');
       try {
-        return { models: await listModels(runtime.get(), id as ProviderId) };
+        return { models: await listModels(runtime.get(), id as ProviderId, chatgpt) };
       } catch (e: any) {
         throw new AppError(502, e?.code ?? 'provider_error', e?.message ?? String(e));
       }
@@ -298,7 +300,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   /** Server-sent events: everything that happens on one board, live. */
   function events(boardId: number, req: IncomingMessage, res: ServerResponse) {
     if (!repo.getBoard(boardId)) return send(res, 404, { error: 'Board not found' });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': res.getHeader('Cache-Control') ?? 'no-cache', Connection: 'keep-alive' });
     const write = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
     write({ type: 'hello', autopilot: autopilot.status(boardId), settingsReceived: runtime.received() });
     const off = engine.bus.on(boardId, write);
@@ -324,6 +326,45 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
+      // The browser retains cross-site fetch metadata through the callback's redirect.
+      // This static confirmation document exposes no account data or credential actions.
+      const publicNavigation = url.pathname === '/' || url.pathname === '/auth/chatgpt/done';
+      if (!localRequest(req, url.pathname === '/auth/callback', publicNavigation)) return send(res, 403, { error: 'Only same-origin loopback requests are allowed' });
+      if (url.pathname.startsWith('/auth/') || url.pathname.startsWith('/api/chatgpt')) {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        if (!chatgpt) throw new ChatGPTError('chatgpt_disabled', 'ChatGPT requires the local 127.0.0.1 server');
+        if (url.pathname === '/auth/chatgpt/authorize' && req.method === 'GET') {
+          const out = chatgpt.authorize(url.searchParams.get('id') ?? '');
+          res.writeHead(302, { Location: out.url, 'Set-Cookie': `ideagen_oauth=${out.cookie}; HttpOnly; SameSite=Lax; Path=/auth; Max-Age=600` });
+          return res.end();
+        }
+        if (url.pathname === '/auth/callback' && req.method === 'GET') {
+          const cookie = req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('ideagen_oauth='))?.slice(14) ?? '';
+          try { await chatgpt.callback(url.searchParams, cookie); } catch { /* Details remain in safe status, never callback URLs or logs. */ }
+          res.writeHead(303, { Location: '/auth/chatgpt/done', 'Set-Cookie': 'ideagen_oauth=; HttpOnly; SameSite=Lax; Path=/auth; Max-Age=0' });
+          return res.end();
+        }
+        if (url.pathname === '/auth/chatgpt/done' && req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+          return res.end('ChatGPT sign-in attempt finished. Return to Idea Generator Settings to check the result. You can close this tab.');
+        }
+        let out: unknown;
+        if (url.pathname === '/api/chatgpt/status' && req.method === 'GET') out = chatgpt.status();
+        else if (req.method === 'POST') {
+          const b = await readJson(req);
+          if (url.pathname === '/api/chatgpt/start') out = chatgpt.begin(`http://${req.headers.host}`, b.accountId, b.consent === true);
+          else if (url.pathname === '/api/chatgpt/cancel') { chatgpt.cancelAttempt(b.attemptId); out = {}; }
+          else if (url.pathname === '/api/chatgpt/select') { chatgpt.select(b.accountId); out = {}; }
+          else if (url.pathname === '/api/chatgpt/signout') out = await chatgpt.signOut(b.accountId);
+          else if (url.pathname === '/api/chatgpt/models') out = { models: await chatgpt.models() };
+          else if (url.pathname === '/api/chatgpt/welcome') { chatgpt.acknowledge(); out = {}; }
+          else if (url.pathname === '/api/chatgpt/resume') { chatgpt.resume(); out = {}; }
+        }
+        if (out === undefined) throw new AppError(404, 'not_found', 'Unknown ChatGPT route');
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify(out));
+      }
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
@@ -340,7 +381,7 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
       }
       throw new AppError(404, 'not_found', `No route for ${req.method} ${url.pathname}`);
     } catch (e: any) {
-      const status = e instanceof AppError ? e.status : 500;
+      const status = e instanceof AppError ? e.status : e instanceof ChatGPTError ? 400 : 500;
       if (status >= 500) console.error(`[${req.method} ${url.pathname}]`, e?.message ?? e);
       send(res, status, { error: e?.message ?? 'Server error', code: e?.code ?? 'server_error' });
     }

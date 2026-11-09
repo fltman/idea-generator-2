@@ -5,7 +5,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 ## Commands
 
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
-- `npm test` – 50 tests (`node --test`), fake LLM and fake provider servers, no network
+- `npm test` – 82 tests (`node --test`), fake LLM and fake provider servers, no network
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
@@ -13,7 +13,8 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
   - Anthropic uses the official SDK with `output_config.format`.
-  - Everything else is OpenAI-compatible.
+  - ChatGPT plan uses the official OSS OAuth flow and streaming Responses API; see `server/chatgpt.ts`.
+  - The remaining providers are OpenAI-compatible.
 - `server/llm.ts` – every prompt, including the judge (`JUDGE_SYSTEM`). Each function takes `model`.
 - `server/engine.ts` – every operation, the background judge queue (max 3) and the per-board event bus.
 - `server/autopilot.ts` – the scheduler and the pure `rateCheck()`.
@@ -33,6 +34,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - **Anthropic native: send no `temperature`.** API version 2026-10-21 rejects it. Use effort `low`. The SDK sends the key as a Bearer token.
 - **OpenRouter: send `reasoning:{enabled:false}`** and retry without it on a 400 that mentions reasoning (some models insist on reasoning).
 - **X scout:** a lead is kept only if its URL is in the search engine's `url_citation` annotations. Never trust a URL the model wrote. Only OpenRouter (Grok) can search X.
+- **ChatGPT OAuth credentials stay server-side.** Never put them in app settings, browser storage, logs, or configurable provider URLs. The protected credential store is separate from the board DB. Tests must use mocks unless live authorization is explicitly requested.
 - **App settings live in the browser's localStorage.** The server holds them in memory, and the SSE `hello` tells the browser to push them again after a restart. Board configuration lives in the DB.
 - **Dollar limits only see providers that report cost** (OpenRouter `usage.cost`, Anthropic via the price table). A limit of 0 means free models only.
 - **Text goes into the DOM as text nodes, never `innerHTML`** (`dom.js`). Ideas are written by models and by visitors.

@@ -1,5 +1,6 @@
 // The app: boards, the canvas, panels, dialogs, live updates.
 
+import { chatgptPanel } from './chatgpt.js';
 import { api, follow } from './api.js';
 import { $, h, clear, toast, debounce } from './dom.js';
 import { t, getLang, setLang, applyI18n, errorText } from './i18n.js';
@@ -280,6 +281,10 @@ function renderHeader() {
       ? h('button', { class: 'linkish', onclick: () => openBoard(b.originBoardId) }, `↳ ${b.originIdeaTitle} · ${b.originBoardTitle}`)
       : '',
   );
+  const usesChatGPT = ROLES.some(r => (b.config.models?.[r] || S.settings.models[r]).startsWith('chatgpt:'));
+  const usage = $('#chatgpt-usage');
+  usage.hidden = !usesChatGPT;
+  clear(usage, getLang() === 'en' ? 'Using ChatGPT plan · ' : 'Använder ChatGPT-plan · ', h('a', { href: 'https://chatgpt.com/settings/usage', target: '_blank', rel: 'noopener noreferrer' }, getLang() === 'en' ? 'Manage usage' : 'Hantera användning'));
   const auto = b.config.mode === 'auto';
   const btn = $('#mode-toggle');
   btn.textContent = auto ? t('auto') : t('manual');
@@ -711,7 +716,7 @@ async function boardSettingsDialog() {
 }
 
 const PROVIDER_LABELS = {
-  openrouter: 'OpenRouter', anthropic: 'Anthropic', openai: 'OpenAI',
+  chatgpt: 'ChatGPT plan', openrouter: 'OpenRouter', anthropic: 'Anthropic', openai: 'OpenAI',
   azure: 'Azure OpenAI / Microsoft Foundry (Copilot models)', ollama: 'Ollama', mlx: 'MLX (mlx_lm.server)', lmstudio: 'LM Studio', custom: 'OpenAI-compatible',
 };
 const HAS_URL = ['ollama', 'mlx', 'lmstudio', 'azure', 'custom'];
@@ -720,14 +725,15 @@ const modelCatalog = new Map();
 
 function refreshModelList() {
   const dl = $('#model-list');
-  clear(dl, [...modelCatalog.entries()].flatMap(([p, ids]) => ids.slice(0, 400).map((id) => h('option', { value: `${p}:${id}` }))));
+  clear(dl, [...modelCatalog.entries()].flatMap(([p, ids]) => ids.slice(0, 400).map((id) => h('option', { value: `${p}:${typeof id === 'string' ? id : id.slug}` }, typeof id === 'string' ? '' : id.displayName))));
 }
 
 function appSettingsDialog() {
   const s = structuredClone(S.settings);
   const status = new Map((S.providers?.providers ?? []).map((p) => [p.id, p]));
   const keys = {}, urls = {};
-  const rows = PROVIDER_IDS.map((p) => {
+  const chatgpt = chatgptPanel(models => { modelCatalog.set('chatgpt', models); refreshModelList(); });
+  const rows = PROVIDER_IDS.filter(p => p !== 'chatgpt').map((p) => {
     const st = status.get(p);
     const result = h('span', { class: 'small muted' });
     keys[p] = HAS_KEY.includes(p) ? h('input', { type: 'password', value: s.keys[p] ?? '', placeholder: t('apiKey'), autocomplete: 'off' }) : null;
@@ -770,12 +776,13 @@ function appSettingsDialog() {
     s.maxUsdPerDay = Number(budget.value);
     S.settings = s;
     S.providers = await saveSettings(s);
+    renderHeader();
     if (close) { dlg.close(); toast(t('settingsSaved')); warnMissingKeys(); }
   }
 
   const dlg = dialog('dlg', t('appSettings'), [
     h('p', { class: 'small muted' }, t('settingsNote')),
-    h('fieldset', {}, h('legend', {}, t('providers')), rows),
+    h('fieldset', {}, h('legend', {}, t('providers')), chatgpt.element, rows),
     h('fieldset', {}, h('legend', {}, t('models')), h('div', { class: 'grid2' }, ROLES.map((r) => field(t(`role_${r}`), models[r]))),
       h('small', { class: 'muted' }, t('calibrateNote'))),
     h('fieldset', {}, h('legend', {}, 'Claude Code'), field(t('projectsRoot'), root)),
@@ -784,6 +791,7 @@ function appSettingsDialog() {
     h('button', { class: 'btn', value: 'cancel' }, t('cancel')),
     h('button', { class: 'btn primary', onclick: (e) => { e.preventDefault(); saveFromForm().catch(fail); } }, t('save')),
   ]);
+  dlg.addEventListener('close', () => chatgpt.close(), { once: true });
 }
 
 function announceDialog(idea) {

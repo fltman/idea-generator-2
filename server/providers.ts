@@ -7,8 +7,9 @@
 // Environment variables are a fallback for keys.
 
 import Anthropic from '@anthropic-ai/sdk';
+import { ChatGPTError, type ChatGPT } from './chatgpt.ts';
 
-export type ProviderId = 'openrouter' | 'anthropic' | 'openai' | 'azure' | 'ollama' | 'mlx' | 'lmstudio' | 'custom';
+export type ProviderId = 'chatgpt' | 'openrouter' | 'anthropic' | 'openai' | 'azure' | 'ollama' | 'mlx' | 'lmstudio' | 'custom';
 export type Role = 'distill' | 'expand' | 'combine' | 'judge' | 'summary' | 'research' | 'x' | 'brief';
 export const ROLES: Role[] = ['distill', 'expand', 'combine', 'judge', 'summary', 'research', 'x', 'brief'];
 
@@ -39,7 +40,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
 
 type ProviderDef = {
   label: string;
-  type: 'openai' | 'anthropic' | 'ollama';
+  type: 'openai' | 'anthropic' | 'ollama' | 'chatgpt';
   base?: string;
   env?: string;
   needsKey: boolean;
@@ -50,6 +51,7 @@ type ProviderDef = {
 };
 
 export const PROVIDERS: Record<ProviderId, ProviderDef> = {
+  chatgpt: { label: 'ChatGPT plan', type: 'chatgpt', needsKey: false, note: 'Local use only. Uses your ChatGPT plan or credits; dollar budgets do not measure this usage.' },
   openrouter: { label: 'OpenRouter', type: 'openai', base: 'https://openrouter.ai/api/v1', env: 'OPENROUTER_API_KEY', needsKey: true, search: true },
   anthropic: { label: 'Anthropic', type: 'anthropic', env: 'ANTHROPIC_API_KEY', needsKey: true },
   openai: { label: 'OpenAI', type: 'openai', base: 'https://api.openai.com/v1', env: 'OPENAI_API_KEY', needsKey: true },
@@ -75,6 +77,7 @@ export function mergeAppSettings(raw: any): AppSettings {
   const s = (v: unknown, max = 500) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
   const out: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
   for (const p of Object.keys(PROVIDERS) as ProviderId[]) {
+    if (p === 'chatgpt') continue; // OAuth credentials and endpoints are never browser settings.
     if (s(raw?.keys?.[p])) out.keys[p] = s(raw.keys[p]);
     if (typeof raw?.baseUrls?.[p] === 'string') out.baseUrls[p] = s(raw.baseUrls[p]).replace(/\/+$/, '');
   }
@@ -292,11 +295,19 @@ async function anthropicChat(settings: AppSettings, model: string, r: ChatReques
 }
 
 /** A chat function that routes every request by its "provider:model" string. */
-export function makeChat(getSettings: () => AppSettings): ChatFn {
+export function makeChat(getSettings: () => AppSettings, chatgpt?: ChatGPT): ChatFn {
   return async (r) => {
     const settings = getSettings();
     const { provider, model } = parseModel(r.model);
     if (!model) throw new ProviderError('bad_model', `No model given in "${r.model}"`);
+    if (provider === 'chatgpt') {
+      if (!chatgpt) throw new ProviderError('chatgpt_disabled', 'ChatGPT is available only on the local loopback server');
+      try { return await chatgpt.chat(r); }
+      catch (e) {
+        if (e instanceof ChatGPTError) throw new ProviderError(e.code, e.message);
+        throw new ProviderError('chatgpt_request_failed', 'ChatGPT request failed. Try again.');
+      }
+    }
     const def = PROVIDERS[provider];
     if (def.type === 'anthropic') return anthropicChat(settings, model, r);
     if (def.type === 'ollama') return ollamaChat(settings, model, r);
@@ -305,7 +316,11 @@ export function makeChat(getSettings: () => AppSettings): ChatFn {
 }
 
 /** List a provider's models, also used as a connection test. */
-export async function listModels(settings: AppSettings, p: ProviderId): Promise<string[]> {
+export async function listModels(settings: AppSettings, p: ProviderId, chatgpt?: ChatGPT): Promise<string[]> {
+  if (p === 'chatgpt') {
+    if (!chatgpt) throw new ProviderError('chatgpt_disabled', 'ChatGPT is available only on the local loopback server');
+    return (await chatgpt.models()).map(m => m.slug);
+  }
   const base = baseFor(settings, p);
   const key = keyFor(settings, p);
   const get = async (url: string, headers: Record<string, string> = {}) => {
