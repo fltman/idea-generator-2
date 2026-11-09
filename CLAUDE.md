@@ -7,7 +7,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
   - Only Host headers naming this server are answered (DNS rebinding). `HOST=0.0.0.0` or `::` adds the address each connection arrived on (`req.socket.localAddress`) and the machine's own name from `os.hostname()`, plain and `.local` (mDNS), on our port.
   - Behind a port forward or proxy, list the names in `ALLOWED_HOSTS` (comma separated): a bare name is accepted on any port, `name:port` on that port only (a Host without a port matches `name:443`, for a TLS proxy). The Origin of a write must still equal the Host it was sent to.
-- `npm test` – 129 tests (`node --test`), fake LLM and fake provider servers, no network
+- `npm test` – 132 tests (`node --test`), fake LLM and fake provider servers, no network
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout

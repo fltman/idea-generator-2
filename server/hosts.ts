@@ -35,3 +35,34 @@ export function unbracketed(host: string): string {
   const h = host.trim();
   return h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
 }
+
+/**
+ * An IPv6 address as its eight 16-bit groups; accepts ::, a dotted IPv4 tail and a zone
+ * id (dropped). The caller checks isIP(address) === 6 first. Shared by both guards, so
+ * they read an IPv4 inside an IPv6 address the same way.
+ */
+export function ipv6Groups(address: string): number[] {
+  let text = address.toLowerCase().split('%')[0];
+  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const [a, b, c, d] = dotted[2].split('.').map(Number);
+    text = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.includes('::') ? text.split('::') : [text, undefined];
+  const parse = (part: string | undefined) => (part ? part.split(':').map((g) => parseInt(g, 16)) : []);
+  const left = parse(head);
+  const right = parse(tail);
+  return tail === undefined ? left : [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+/**
+ * The IPv4 address of an IPv4-mapped IPv6 address (::ffff:a.b.c.d, or the same written
+ * in hex, ::ffff:7f00:1), or null. A dual-stack socket reports an IPv4 connection this way.
+ */
+export function unmappedIPv4(address: string): string | null {
+  const bare = address.split('%')[0];
+  if (isIP(bare) !== 6) return null;
+  const g = ipv6Groups(bare);
+  if (!g.slice(0, 5).every((x) => x === 0) || g[5] !== 0xffff) return null;
+  return [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff].join('.');
+}

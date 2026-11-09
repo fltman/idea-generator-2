@@ -67,7 +67,7 @@ export type AutopilotStatus = {
   spentToday?: number;
 };
 
-type BoardState = { busy: boolean; steps: number[]; lastAt: number; errors: number; lastErrorAt: number; status: AutopilotStatus; sent: string };
+type BoardState = { busy: boolean; auto: boolean; steps: number[]; lastAt: number; errors: number; lastErrorAt: number; status: AutopilotStatus; sent: string };
 
 export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: () => AppSettings; now?: () => number; tickMs?: number }) {
   const { repo, engine } = deps;
@@ -99,14 +99,16 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
         // Forgetting them would let a manual-auto toggle start a second step beside the
         // first, or skip the hourly limit and the backoff.
         const s = states.get(b.id);
+        if (s) s.auto = false; // a step still running reads this when it ends
         if (s && !s.busy) publish(b.id, s, { state: 'manual', last: s.status.last }); // the last result stays visible
         continue;
       }
       let s = states.get(b.id);
       if (!s) {
-        s = { busy: false, steps: [], lastAt: 0, errors: 0, lastErrorAt: 0, status: { state: 'idle' }, sent: '' };
+        s = { busy: false, auto: true, steps: [], lastAt: 0, errors: 0, lastErrorAt: 0, status: { state: 'idle' }, sent: '' };
         states.set(b.id, s);
       }
+      s.auto = true;
       if (s.busy) continue;
       s.steps = s.steps.filter((x) => x > t - HOUR);
       const boardSpent = repo.spentOn(b.id);
@@ -127,8 +129,8 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
       const st = s;
       // A step can outlast the board's auto mode: the user switches it to manual while
       // the step runs. Its result still counts toward the limits, but the status it shows
-      // is manual, not a pace or backoff of an autopilot that is off.
-      const stillAuto = () => repo.getBoard(b.id)?.config.mode === 'auto';
+      // is manual, not a pace or backoff of an autopilot that is off. Every tick records
+      // each board's mode in its state (st.auto), so the step reads that, not the DB.
       // Or it outlasts the board itself. Board ids are reused (INTEGER PRIMARY KEY without
       // AUTOINCREMENT): after the newest board is deleted, the next one gets its id. A
       // deleted board's state was dropped from the map, so a step whose state is no longer
@@ -143,7 +145,7 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
           st.lastAt = now();
           st.errors = 0;
           const last = r.did === 'idle' ? r.reason : r.did;
-          if (!stillAuto()) return publish(b.id, st, { state: 'manual', last });
+          if (!st.auto) return publish(b.id, st, { state: 'manual', last });
           publish(b.id, st, {
             state: r.did === 'idle' ? 'idle' : 'pace', until: now() + b.config.autopilotSeconds * 1000,
             last, stepsLastHour: st.steps.length, spentToday: counts.spentToday,
@@ -154,7 +156,7 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
           st.errors++;
           st.lastErrorAt = st.lastAt = now();
           const last = st.status.last;
-          if (!stillAuto()) return publish(b.id, st, { state: 'manual', last });
+          if (!st.auto) return publish(b.id, st, { state: 'manual', last });
           publish(b.id, st, {
             state: 'error', code: e?.code ?? 'error', message: e?.message ?? String(e), until: now() + backoffMs(st.errors), last, ...counts,
           });
@@ -186,6 +188,16 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
      */
     forget(boardId: number) {
       states.delete(boardId);
+    },
+    /**
+     * A board's mode changed (the PATCH route). A step still running reads st.auto when
+     * it ends; without this it would see the change only at the next tick, and show a
+     * pace for an autopilot that is already off. The tick records the mode as well, so a
+     * change made some other way is seen within a tick.
+     */
+    modeChanged(boardId: number, mode: string) {
+      const s = states.get(boardId);
+      if (s) s.auto = mode === 'auto';
     },
     /** Boards the scheduler currently keeps state for. */
     tracked(): number[] {

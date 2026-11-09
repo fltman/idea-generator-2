@@ -345,7 +345,8 @@ test('scheduler: a step that ends after the board went manual shows manual, and 
   };
   const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
   const board = repo.createBoard({ title: 'Late', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
-  const mode = (m: 'auto' | 'manual') => repo.updateBoard(board.id, { config: { mode: m } });
+  // As the PATCH route does: save the mode, then tell the autopilot.
+  const mode = (m: 'auto' | 'manual') => { repo.updateBoard(board.id, { config: { mode: m } }); ap.modeChanged(board.id, m); };
   const flush = () => new Promise((r) => setTimeout(r, 5));
   const shown: string[] = [];
   engine.bus.on(board.id, (e: any) => { if (e.type === 'autopilot') shown.push(e.status.state); });
@@ -373,4 +374,28 @@ test('scheduler: a step that ends after the board went manual shows manual, and 
   mode('auto'); now += 1_000; await ap.tick();
   assert.equal(ap.status(board.id).state, 'backoff');
   assert.equal(ap.status(board.id).last, 'combine', 'the last result survives manual, error and backoff');
+});
+
+test('scheduler: a finishing step reads the mode the tick recorded, not the board from the DB', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let settle!: () => void;
+  const slow = { ...engine, autoStep: () => new Promise<{ did: 'combine' }>((ok) => { settle = () => ok({ did: 'combine' }); }) };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'B', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap.tick();
+  // Switched to manual some other way than the route (no modeChanged): the next tick sees it.
+  repo.updateBoard(board.id, { config: { mode: 'manual' } });
+  await ap.tick();
+  let reads = 0;
+  const getBoard = repo.getBoard;
+  repo.getBoard = (id: number) => (reads++, getBoard(id));
+  try {
+    settle(); await new Promise((r) => setTimeout(r, 5));
+  } finally {
+    repo.getBoard = getBoard;
+  }
+  assert.equal(reads, 0, 'the step result reads no board');
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
 });

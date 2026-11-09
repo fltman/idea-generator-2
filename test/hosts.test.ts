@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { bracketed, isLoopbackHost, unbracketed } from '../server/hosts.ts';
+import { bracketed, ipv6Groups, isLoopbackHost, unbracketed, unmappedIPv4 } from '../server/hosts.ts';
 import { allowedHosts, isWildcard, parseAllowedHosts } from '../server/app.ts';
 import { assertPublicUrl } from '../server/extract.ts';
 
@@ -62,4 +62,20 @@ test('both guards take "this machine" from hosts.ts, not a definition of their o
     assert.match(src, /isLoopbackHost/, `${file} uses isLoopbackHost`);
     assert.doesNotMatch(src, /endsWith\(['"]\.localhost['"]\)|startsWith\(['"]127\./, `${file} has its own loopback test; use isLoopbackHost`);
   }
+});
+
+test('unmappedIPv4: the IPv4 inside ::ffff:0:0/96, dotted or hex, and nothing else', () => {
+  for (const [a, v4] of [
+    ['::ffff:192.168.1.20', '192.168.1.20'], ['::FFFF:10.8.0.2', '10.8.0.2'], ['::ffff:a08:2', '10.8.0.2'],
+    ['::ffff:7f00:1', '127.0.0.1'], ['0:0:0:0:0:ffff:c0a8:114', '192.168.1.20'], ['::ffff:8.8.8.8%3', '8.8.8.8'],
+  ]) assert.equal(unmappedIPv4(a), v4, a);
+  for (const a of ['192.168.1.20', '::1', '::', 'fe80::1', '::ffff:0:a08:2', '64:ff9b::a08:2', '1::ffff:a08:2', '2002:a08:2::1', 'not-an-ip', ''])
+    assert.equal(unmappedIPv4(a), null, a);
+  assert.deepEqual(ipv6Groups('::ffff:1.2.3.4'), [0, 0, 0, 0, 0, 0xffff, 0x102, 0x304]);
+});
+
+test('one IPv6 parser: extract.ts and app.ts take it from hosts.ts', () => {
+  const src = (f: string) => readFileSync(join(import.meta.dirname, '..', 'server', f), 'utf8');
+  assert.ok(!/function ipv6Groups/.test(src('extract.ts')), 'no copy in extract.ts');
+  assert.ok(!/::ffff:\(/i.test(src('app.ts')), 'no IPv4-mapped regex in app.ts');
 });

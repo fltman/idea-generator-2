@@ -285,6 +285,8 @@ test('HOST=0.0.0.0 or :: answers to the address each connection arrived on', () 
   assert.equal(arrivalKey('192.168.1.20', 8300), '192.168.1.20:8300');
   assert.equal(arrivalKey('::ffff:192.168.1.20', 8300), '192.168.1.20:8300', 'IPv4 on a dual-stack socket');
   assert.equal(arrivalKey('::FFFF:10.8.0.2', 8300), '10.8.0.2:8300');
+  assert.equal(arrivalKey('::ffff:a08:2', 8300), '10.8.0.2:8300', 'the same address written in hex');
+  assert.equal(arrivalKey('0:0:0:0:0:ffff:7f00:1', 8300), '127.0.0.1:8300', 'and spelled out');
   assert.equal(arrivalKey('fe80::1%15', 8300), '[fe80::1]:8300', 'zone id dropped');
   assert.equal(arrivalKey('2001:0db8:0:0:0:0:0:1', 8300), '[2001:db8::1]:8300', 'compressed like the Host');
   for (const bad of [undefined, '', '0.0.0.0', '::', 'not-an-ip']) assert.equal(arrivalKey(bad, 8300), null, String(bad));

@@ -7,8 +7,8 @@ import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
 import { isIP } from 'node:net';
 import { hostname as osHostname } from 'node:os';
-import type { Repo, Idea, Board } from './db.ts';
-import { bracketed, isLoopbackHost, unbracketed } from './hosts.ts';
+import { wholeDays, type Repo, type Idea, type Board } from './db.ts';
+import { bracketed, isLoopbackHost, unbracketed, unmappedIPv4 } from './hosts.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
 import { PROVIDERS, keySource, listModels, mergeAppSettings, type AppSettings, type ProviderId } from './providers.ts';
@@ -46,7 +46,7 @@ const TYPES: Record<string, string> = {
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 // Whole days only: localDays() steps back k days with new Date(y, m, d - k), and a
 // fractional k would truncate to yesterday and leave today out of the period.
-const clampDays = (v: unknown) => Math.round(Math.min(365, Math.max(1, Number(v) || 30)));
+const clampDays = (v: unknown) => Math.min(365, wholeDays(Number(v) || 30)); // the same rounding as db.ts
 const daysOf = (url: URL) => clampDays(url.searchParams.get('days'));
 
 /**
@@ -162,8 +162,7 @@ export function isWildcard(host: string) {
  */
 export function arrivalKey(address: string | undefined, port: number): string | null {
   if (!address) return null;
-  const bare = address.split('%')[0];
-  const ip = bare.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i)?.[1] ?? bare;
+  const ip = unmappedIPv4(address) ?? address.split('%')[0];
   if (!isIP(ip) || isWildcard(ip)) return null;
   return hostKey(`${bracketed(ip)}:${port}`);
 }
@@ -489,7 +488,9 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir, hos
       if (typeof b.title === 'string' && b.title.trim()) patch.title = str(b.title, 120);
       if (typeof b.goal === 'string') patch.goal = str(b.goal, 600);
       if (b.config && typeof b.config === 'object') patch.config = b.config;
-      return engine.updateBoard(+id, patch);
+      const out = engine.updateBoard(+id, patch);
+      autopilot.modeChanged(+id, out.board.config.mode); // a step still running ends as manual at once
+      return out;
     }],
     ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => {
       autopilot.forget(+id); // before the id can be handed to a new board

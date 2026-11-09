@@ -491,7 +491,7 @@ export function openDb(file: string) {
       const ranges = localDayRanges(dayList);
       const since = ranges[0][0];
       const until = ranges[ranges.length - 1][1];
-      const first = fromSqlUtc(since); // local midnight of the first day, already in ranges[0]
+      const first = localMidnight(dayList[0]); // the first shown day (not firstLocalDay(): no second clock read)
       const before = sqlUtc(new Date(first.getFullYear(), first.getMonth(), first.getDate() - days));
       const rows = db
         .prepare(
@@ -829,9 +829,6 @@ export function dayOf(starts: string[], at: string): number {
   }
   return found;
 }
-
-/** The instant a sqlUtc() string names. */
-const fromSqlUtc = (s: string) => new Date(`${s.replace(' ', 'T')}Z`);
 
 /** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
 const sqlUtc = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');

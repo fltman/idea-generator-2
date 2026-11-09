@@ -6,7 +6,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import type { LookupAddress } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
 import { Agent, fetch as undiciFetch } from 'undici';
-import { isLoopbackHost, unbracketed } from './hosts.ts';
+import { ipv6Groups, isLoopbackHost, unbracketed } from './hosts.ts';
 
 const MAX_BYTES = 2_000_000;
 const MAX_CHARS = 6000;
@@ -38,21 +38,6 @@ for (const [net, bits] of [
   ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b:1::', 48], ['2001::', 32], ['2001:db8::', 32],
   ['fc00::', 7], ['fec0::', 10], ['fe80::', 10], ['ff00::', 8],
 ] as const) PRIVATE.addSubnet(net, bits, 'ipv6');
-
-/** An IPv6 address as its eight 16-bit groups; accepts :: and a dotted IPv4 tail. */
-function ipv6Groups(address: string): number[] {
-  let text = address.toLowerCase().split('%')[0];
-  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
-  if (dotted) {
-    const [a, b, c, d] = dotted[2].split('.').map(Number);
-    text = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
-  }
-  const [head, tail] = text.includes('::') ? text.split('::') : [text, undefined];
-  const parse = (part: string | undefined) => (part ? part.split(':').map((g) => parseInt(g, 16)) : []);
-  const left = parse(head);
-  const right = parse(tail);
-  return tail === undefined ? left : [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
-}
 
 /**
  * The IPv4 address a NAT64 (64:ff9b::/96, RFC 6052) or 6to4 (2002::/16, RFC 3056)
