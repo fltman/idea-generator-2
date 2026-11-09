@@ -221,8 +221,17 @@ test('a deleted board\'s step that is still waiting on the model writes nothing 
       repo.saveJudgement(c.id, { originality: 3, feasibility: 3, impact: 3, reason: 'r' });
     }
 
-    const step = engine.autoStep(old.id).then(() => null, (e: any) => e);
-    await new Promise((r) => setTimeout(r, 10)); // waiting on the model now
+    // nextMove expands instead of combining on a random 20% ("mutation"): pin the dice
+    // while the step picks its move, so each scenario reaches the call it is named after.
+    const random = Math.random;
+    Math.random = () => 0.5;
+    let step: Promise<any>;
+    try {
+      step = engine.autoStep(old.id).then(() => null, (e: any) => e);
+      await new Promise((r) => setTimeout(r, 10)); // waiting on the model now
+    } finally {
+      Math.random = random;
+    }
     assert.deepEqual(asked, [scenario === 'judge' ? 'judgement' : scenario], `${scenario}: the step is waiting on that call`);
 
     engine.deleteBoard(old.id);
