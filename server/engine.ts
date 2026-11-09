@@ -148,35 +148,51 @@ export function createEngine(deps: Deps) {
   // counted here. An operation reads the count when it starts (`since`) and passes it
   // to call(), which refuses a result that comes back after a delete; an operation that
   // also waits on something else (a page, the paper list, the disk) checks again with
-  // stillThere() before it goes on.
+  // stillThere() before it goes on. Ideas deleted on their own are counted the same way:
+  // an operation on an idea (judge, expand, combine, project) watches it too.
   const deletions = new Map<number, number>();
+  const ideaDeletions = new Map<number, number>();
   const deletesOf = (boardId: number) => deletions.get(boardId) ?? 0;
+  const ideaDeletesOf = (ideaId: number) => ideaDeletions.get(ideaId) ?? 0;
   const boardDeleted = (what = 'the model was working') => new AppError(409, 'board_deleted', `The board was deleted while ${what}`);
-  /** Throws board_deleted if the board was deleted since `since` (a deletesOf() reading). */
-  function stillThere(boardId: number, since: number, what?: string) {
-    if (deletesOf(boardId) !== since) throw boardDeleted(what);
+  const ideaDeleted = (what = 'the model was working') => new AppError(409, 'idea_deleted', `The idea was deleted while ${what}`);
+  /** board_deleted or idea_deleted: the operation's ids may be someone else's now; report nothing to them. */
+  const isGone = (e: any) => e?.code === 'board_deleted' || e?.code === 'idea_deleted';
+
+  /** What an operation depends on, with the delete counts read when it started. */
+  type Watch = { boardId: number; board: number; ideas: [number, number][] };
+  const watch = (boardId: number, ideaIds: number[] = []): Watch =>
+    ({ boardId, board: deletesOf(boardId), ideas: ideaIds.map((id) => [id, ideaDeletesOf(id)]) });
+  function goneError(w: Watch, what?: string) {
+    if (deletesOf(w.boardId) !== w.board) return boardDeleted(what);
+    for (const [id, n] of w.ideas) if (ideaDeletesOf(id) !== n) return ideaDeleted(what);
+    return null;
+  }
+  /** Throws board_deleted or idea_deleted if something the operation watches was deleted since it started. */
+  function stillThere(w: Watch, what?: string) {
+    const e = goneError(w, what);
+    if (e) throw e;
   }
 
-  async function call<T extends { costUsd: number }>(boardId: number, fn: () => Promise<T>, since = deletesOf(boardId)): Promise<T> {
-    stillThere(boardId, since); // already gone: no model call, no cost
-    const before = since;
+  async function call<T extends { costUsd: number }>(on: number | Watch, fn: () => Promise<T>): Promise<T> {
+    const w = typeof on === 'number' ? watch(on) : on;
+    stillThere(w); // already gone: no model call, no cost
     let out: T;
     try {
       out = await fn();
     } catch (e: any) {
-      // Failed after the board was deleted: the error is not this id's any more (it may be
-      // another board's now), so callers that skip board_deleted must see that, not a 502.
-      if (deletesOf(boardId) !== before) throw boardDeleted();
+      // Failed after a delete: the error is not this id's any more (it may be another
+      // board's or idea's now), so callers that skip isGone() must see that, not a 502.
+      const gone = goneError(w);
+      if (gone) throw gone;
       if (e instanceof AppError) throw e;
       throw new AppError(502, e instanceof ProviderError ? e.code : 'llm_failed', e?.message ?? String(e));
     }
-    if (deletesOf(boardId) !== before) {
-      // The money is spent: book it to no board (0), so the global limit still sees it
-      // and the board that now has this id is not charged.
-      repo.addSpend(0, out.costUsd);
-      throw boardDeleted();
-    }
-    repo.addSpend(boardId, out.costUsd);
+    const gone = goneError(w);
+    // The money is spent. A deleted board's goes to no board (0), so the global limit still
+    // sees it and the board that now has this id is not charged; a deleted idea's board paid.
+    repo.addSpend(gone?.code === 'board_deleted' ? 0 : w.boardId, out.costUsd);
+    if (gone) throw gone;
     return out;
   }
 
@@ -195,20 +211,20 @@ export function createEngine(deps: Deps) {
   async function createProject(idea: Idea) {
     if (idea.projectPath && existsSync(idea.projectPath)) return { idea, path: idea.projectPath, existed: true };
     const board = mustBoard(idea.boardId);
-    const since = deletesOf(board.id);
+    const since = watch(board.id, [idea.id]);
     const lineage = repo.lineage(idea.id);
     const lang = board.config.lang;
-    const { brief } = await call(board.id, () => writeBrief({ chat: deps.chat, model: modelFor(board, 'brief'), idea, goal: board.goal, lineage, lang }), since);
+    const { brief } = await call(since, () => writeBrief({ chat: deps.chat, model: modelFor(board, 'brief'), idea, goal: board.goal, lineage, lang }));
     let path: string;
     try {
       path = await writeProject({ root: deps.settings().projectsRoot, brief, idea, goal: board.goal, lineage, lang, gitInit: deps.gitInit });
     } catch (e: any) {
-      stillThere(board.id, since, 'its project folder was being written'); // same as a model call failing late
+      stillThere(since, 'its project folder was being written'); // same as a model call failing late
       throw new AppError(500, 'project_failed', e?.message ?? String(e));
     }
     // Deleted while the folder was written: the idea's id may be another board's idea
     // now, so record nothing. The folder stays (folders are never deleted here); say where.
-    stillThere(board.id, since, `its project folder was being written; the folder is at ${path}`);
+    stillThere(since, `its project folder was being written; the folder is at ${path}`);
     const saved = repo.setProjectPath(idea.id, path)!;
     emitIdeas(board.id, [saved]);
     return { idea: saved, path, existed: false };
@@ -217,11 +233,11 @@ export function createEngine(deps: Deps) {
   async function judge(ideaId: number) {
     const idea = mustIdea(ideaId);
     const board = mustBoard(idea.boardId);
-    const deletes = deletesOf(board.id);
+    const since = watch(board.id, [idea.id]);
     const owner = Symbol('judgement');
     setJudging(board.id, [idea.id], true, owner);
     try {
-      const { judgement } = await call(board.id, () =>
+      const { judgement } = await call(since, () =>
         llm.judge({
           model: modelFor(board, 'judge'), board, idea, lang: board.config.lang,
           guidance: board.config.judgeGuidance, vocabulary: repo.keywordVocabulary(),
@@ -237,15 +253,15 @@ export function createEngine(deps: Deps) {
           out.project = p.path;
           bus.emit(board.id, { type: 'project', ideaId: idea.id, path: p.path, byJudge: true });
         } catch (e: any) {
-          if (e?.code === 'board_deleted') throw e; // not a project error: the board is gone
+          if (isGone(e)) throw e; // not a project error: the board or the idea is gone
           out.projectError = e?.message ?? String(e);
         }
       }
       emitIdeas(board.id, [out.idea]);
       return out;
     } finally {
-      // Tell the board's page the spinner is off, unless the board is gone: its id may be another board's now.
-      setJudging(board.id, [idea.id], false, owner, deletesOf(board.id) === deletes);
+      // Tell the board's page the spinner is off, unless the board or idea is gone: the id may be someone else's now.
+      setJudging(board.id, [idea.id], false, owner, !goneError(since));
     }
   }
 
@@ -259,7 +275,7 @@ export function createEngine(deps: Deps) {
       active++;
       judge(id)
         .catch((e: any) => {
-          if (e?.code === 'board_deleted') return; // the idea's id may belong to another board's idea now
+          if (isGone(e)) return; // the idea's id may belong to another idea now
           const boardId = repo.getIdea(id)?.boardId;
           if (boardId) bus.emit(boardId, { type: 'error', code: e?.code ?? 'judge_failed', message: e?.message ?? String(e), ideaId: id });
         })
@@ -285,7 +301,7 @@ export function createEngine(deps: Deps) {
   async function doExpand(parentId: number) {
     const parent = mustIdea(parentId);
     const board = mustBoard(parent.boardId);
-    const { ideas } = await call(board.id, () =>
+    const { ideas } = await call(watch(board.id, [parent.id]), () =>
       llm.expand({ model: modelFor(board, 'expand'), flow: board.config.flow, board, idea: parent, existingTitles: titles(board.id), lang: board.config.lang }),
     );
     const spots = arcPositions(parent, repo.parentsOf(parent.id)[0] ?? null, ideas.length);
@@ -304,7 +320,7 @@ export function createEngine(deps: Deps) {
     const a = mustIdea(aId);
     const c = mustIdea(bId);
     if (a.boardId !== board.id || c.boardId !== board.id) throw new AppError(400, 'bad_pair', 'Ideas belong to another board');
-    const { idea } = await call(board.id, () =>
+    const { idea } = await call(watch(board.id, [a.id, c.id]), () =>
       llm.combine({ model: modelFor(board, 'combine'), flow: board.config.flow, board, a, b: c, existingTitles: titles(board.id), lang: board.config.lang }),
     );
     const dx = c.x - a.x, dy = c.y - a.y, len = Math.hypot(dx, dy) || 1; // midpoint, nudged off the line
@@ -331,7 +347,7 @@ export function createEngine(deps: Deps) {
 
     async seed(boardId: number, b: { text: string; x?: number; y?: number }) {
       const board = mustBoard(boardId);
-      const since = deletesOf(board.id);
+      const since = watch(board.id);
       const text = String(b.text ?? '').trim().slice(0, 20_000);
       if (!text) throw new AppError(400, 'empty', 'Write an idea or paste a link');
       const lang = board.config.lang;
@@ -347,15 +363,15 @@ export function createEngine(deps: Deps) {
         } catch (e: any) {
           throw new AppError(422, 'url_unreadable', `${url}: ${e?.message ?? e}`);
         }
-        stillThere(board.id, since, 'the link was being read');
+        stillThere(since, 'the link was being read');
         if (page.text.length < 80) throw new AppError(422, 'url_no_text', `${url}: too little readable text`);
-        const { idea } = await call(board.id, () =>
+        const { idea } = await call(since, () =>
           llm.distill({ model: modelFor(board, 'distill'), flow, board, text: [page.title, page.text].filter(Boolean).join('\n\n'), url, lang }),
-        since);
+        );
         ({ title, pitch } = idea);
         sourceUrl = url;
       } else if (text.length > 160) {
-        const { idea } = await call(board.id, () => llm.distill({ model: modelFor(board, 'distill'), flow, board, text, lang }), since);
+        const { idea } = await call(since, () => llm.distill({ model: modelFor(board, 'distill'), flow, board, text, lang }));
         ({ title, pitch } = idea);
       }
       const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
@@ -421,8 +437,15 @@ export function createEngine(deps: Deps) {
 
     deleteIdea(ideaId: number) {
       const idea = repo.getIdea(ideaId);
+      // Idea ids are reused too: an operation still running on this idea must write
+      // nothing into the next idea that gets its id (see call() and watch()).
+      ideaDeletions.set(ideaId, ideaDeletesOf(ideaId) + 1);
       const ok = repo.deleteIdea(ideaId);
-      if (idea) bus.emit(idea.boardId, { type: 'removed', ids: [ideaId] });
+      if (idea) {
+        // A judgement still running for it must not make the next idea with its id look busy.
+        if (judging.delete(ideaId)) bus.emit(idea.boardId, { type: 'judging', ids: [ideaId], on: false });
+        bus.emit(idea.boardId, { type: 'removed', ids: [ideaId] });
+      }
       return { ok };
     },
 
@@ -514,13 +537,13 @@ export function createEngine(deps: Deps) {
     // ---- leads: each board's own researchers
     async refreshLeads(boardId: number, source: 'x' | 'research') {
       const board = mustBoard(boardId);
-      const since = deletesOf(board.id);
+      const since = watch(board.id);
       const lang = board.config.lang;
       const focus = board.config.researchers[source].focus;
       const topic = [board.goal, focus].filter(Boolean).join(' — ');
       let r: { leads: any[]; dropped?: number };
       if (source === 'x') {
-        r = await call(board.id, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang }), since);
+        r = await call(since, () => xLeads({ chat: deps.chat, model: modelFor(board, 'x'), goal: topic, lang }));
       } else {
         let papers;
         try {
@@ -528,8 +551,8 @@ export function createEngine(deps: Deps) {
         } catch (e: any) {
           throw new AppError(502, 'research_failed', e?.message ?? String(e));
         }
-        stillThere(board.id, since, 'the papers were being fetched');
-        r = await call(board.id, () => researchLeads({ chat: deps.chat, model: modelFor(board, 'research'), goal: topic, lang, papers }), since);
+        stillThere(since, 'the papers were being fetched');
+        r = await call(since, () => researchLeads({ chat: deps.chat, model: modelFor(board, 'research'), goal: topic, lang, papers }));
       }
       // Nothing verified: keep the old leads rather than wiping the panel.
       const leads = r.leads.length ? repo.replaceLeads(board.id, source, r.leads) : repo.listLeads(board.id).filter((l) => l.source === source);
@@ -573,14 +596,20 @@ export function createEngine(deps: Deps) {
       }
       const move = nextMove(ideas, repo.listEdges(boardId), { busy: judging });
       if (!move) return { did: 'idle', reason: 'nothing_to_do' };
-      if (move.type === 'expand') {
-        const r = await doExpand(move.idea.id);
-        await judgeAll(r.ideas.map((i) => i.id));
-        return { did: 'expand', ids: r.ideas.map((i) => i.id) };
+      try {
+        if (move.type === 'expand') {
+          const r = await doExpand(move.idea.id);
+          await judgeAll(r.ideas.map((i) => i.id));
+          return { did: 'expand', ids: r.ideas.map((i) => i.id) };
+        }
+        const r = await doCombine(boardId, move.a.id, move.b.id);
+        await judgeAll([r.idea.id]);
+        return { did: 'combine', ids: [r.idea.id] };
+      } catch (e: any) {
+        // Someone deleted the idea the step was working on: not an error worth a backoff.
+        if (e?.code === 'idea_deleted') return { did: 'idle', reason: 'idea_deleted' };
+        throw e;
       }
-      const r = await doCombine(boardId, move.a.id, move.b.id);
-      await judgeAll([r.idea.id]);
-      return { did: 'combine', ids: [r.idea.id] };
     },
   };
 }
