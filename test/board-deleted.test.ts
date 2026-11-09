@@ -121,3 +121,57 @@ test('a board delete moves its spend to no board: the next board with that id st
   assert.equal(repo.deleteBoard(old.id + 100), false, 'deleting a board that does not exist changes nothing');
   assert.deepEqual(repo.spentTotal(), { usd: 0.55, calls: 3 });
 });
+
+test('board 0 (spend that belongs to no board) cannot be deleted: its spend stays', () => {
+  const repo = openDb(':memory:');
+  const engine = createEngine({ repo, chat: async () => { throw new Error('no model'); }, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
+  repo.addSpend(0, 0.3);
+  repo.addSpend(0, 0.2, '2026-11-01');
+  assert.equal(repo.deleteBoard(0), false);
+  assert.equal(engine.deleteBoard(0), false, 'the DELETE route goes through here');
+  assert.equal(repo.deleteBoard(-1), false);
+  assert.equal(repo.spentOn(0), 0.3, 'not doubled and not wiped');
+  assert.equal(repo.spentOn(0, '2026-11-01'), 0.2);
+  assert.deepEqual(repo.spentTotal(), { usd: 0.5, calls: 2 });
+});
+
+test('an old judgement on a deleted board does not clear the judging flag of a new idea with the same id', async () => {
+  const repo = openDb(':memory:');
+  const releases: (() => void)[] = [];
+  const chat = async (_r: ChatRequest) => {
+    await new Promise<void>((r) => releases.push(r));
+    return { value: { reason: 'r', originality: 2, feasibility: 2, impact: 2, keywords: ['k'] }, costUsd: 0.25 };
+  };
+  const engine = createEngine({ repo, chat, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
+  const tick = () => new Promise((r) => setTimeout(r, 10));
+  const seed = (boardId: number, title: string) =>
+    repo.insertIdea({ boardId, title, pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+
+  const old = repo.createBoard({ title: 'Gammal' });
+  const oldIdea = seed(old.id, 'Gammal idé');
+  const oldJudging = engine.judge(oldIdea.id).then(() => null, (e: any) => e);
+  await tick();
+  assert.ok(engine.judging.has(oldIdea.id));
+
+  engine.deleteBoard(old.id);
+  assert.ok(!engine.judging.has(oldIdea.id), 'the deleted board\'s ideas are no longer busy');
+  const next = repo.createBoard({ title: 'Ny' });
+  const idea = seed(next.id, 'Ny idé');
+  assert.equal(idea.id, oldIdea.id, 'the new idea gets the old idea\'s id');
+  engine.queueJudge([idea.id]);
+  await tick();
+  assert.equal(releases.length, 2, 'the new idea is judged, not skipped as busy');
+  assert.ok(engine.judging.has(idea.id));
+
+  releases[0](); // the old judgement ends first
+  assert.equal((await oldJudging)?.code, 'board_deleted');
+  assert.ok(engine.judging.has(idea.id), 'the new idea is still being judged');
+  engine.queueJudge([idea.id]);
+  await tick();
+  assert.equal(releases.length, 2, 'so it is not queued a second time');
+
+  releases[1]();
+  await engine.idle();
+  assert.ok(!engine.judging.has(idea.id), 'its own judgement clears it');
+  assert.equal(repo.getIdea(idea.id)!.originality, 2, "the new idea got its own judgement");
+});

@@ -408,6 +408,9 @@ export function openDb(file: string) {
       // The spend ledger has no foreign key, and board ids are reused: left under this
       // id, today's spend would count against the next board that gets it. It moves to
       // board 0 (spend that belongs to no board), so totals and history keep it.
+      // Only for a board that exists: id 0 is that no-board ledger itself (moving it onto
+      // itself and then deleting it would wipe it), and no other missing id has spend to move.
+      if (!(id > 0) || !db.prepare('SELECT 1 FROM boards WHERE id = ?').get(id)) return false;
       return tx(() => {
         db.prepare(
           `INSERT INTO spend (board_id, day, usd, calls) SELECT 0, day, usd, calls FROM spend WHERE board_id = ?

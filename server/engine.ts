@@ -119,7 +119,8 @@ export function createEngine(deps: Deps) {
   const reveal = deps.reveal ?? revealInFileManager;
   const llm = makeLLM(deps.chat);
   const bus = createBus();
-  const judging = new Set<number>();
+  /** Ideas being judged: idea id → its board and the judgement that owns the entry. */
+  const judging = new Map<number, { boardId: number; owner: symbol }>();
 
   const mustBoard = (id: number) => {
     const b = repo.getBoard(id);
@@ -174,8 +175,13 @@ export function createEngine(deps: Deps) {
 
   // ---------------------------------------------------------------- judging
 
-  function setJudging(boardId: number, ids: number[], on: boolean, emit = true) {
-    for (const id of ids) on ? judging.add(id) : judging.delete(id);
+  // Idea ids are reused: a judgement only clears the entry it set, never one a later
+  // idea with the same id set after this idea's board was deleted.
+  function setJudging(boardId: number, ids: number[], on: boolean, owner: symbol, emit = true) {
+    for (const id of ids) {
+      if (on) judging.set(id, { boardId, owner });
+      else if (judging.get(id)?.owner === owner) judging.delete(id);
+    }
     if (emit) bus.emit(boardId, { type: 'judging', ids, on });
   }
 
@@ -204,7 +210,8 @@ export function createEngine(deps: Deps) {
     const idea = mustIdea(ideaId);
     const board = mustBoard(idea.boardId);
     const deletes = deletesOf(board.id);
-    setJudging(board.id, [idea.id], true);
+    const owner = Symbol('judgement');
+    setJudging(board.id, [idea.id], true, owner);
     try {
       const { judgement } = await call(board.id, () =>
         llm.judge({
@@ -230,7 +237,7 @@ export function createEngine(deps: Deps) {
       return out;
     } finally {
       // Tell the board's page the spinner is off, unless the board is gone: its id may be another board's now.
-      setJudging(board.id, [idea.id], false, deletesOf(board.id) === deletes);
+      setJudging(board.id, [idea.id], false, owner, deletesOf(board.id) === deletes);
     }
   }
 
@@ -372,6 +379,9 @@ export function createEngine(deps: Deps) {
      */
     deleteBoard(boardId: number) {
       deletions.set(boardId, deletesOf(boardId) + 1);
+      // Its ideas are gone: a judgement still running for one must not make the next
+      // idea that gets its id look busy (it would be skipped by the queue and the autopilot).
+      for (const [id, j] of judging) if (j.boardId === boardId) judging.delete(id);
       return repo.deleteBoard(boardId);
     },
 
