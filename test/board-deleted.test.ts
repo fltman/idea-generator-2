@@ -175,3 +175,68 @@ test('an old judgement on a deleted board does not clear the judging flag of a n
   assert.ok(!engine.judging.has(idea.id), 'its own judgement clears it');
   assert.equal(repo.getIdea(idea.id)!.originality, 2, "the new idea got its own judgement");
 });
+
+/** A judge that waits for fail() or pass(), on a board with automatic projects. */
+function failingSetup(opts: { gold?: boolean; writeProject?: (a: any) => Promise<string> } = {}) {
+  const repo = openDb(':memory:');
+  let fail!: () => void;
+  const failed = new Promise<void>((r) => (fail = r));
+  const chat = async (r: ChatRequest) => {
+    if (r.schemaName === 'brief') return { value: { name: 'Bänk', slug: 'bank', oneLiner: 'o', problem: 'p', audience: 'a', mvp: ['m'], outOfScope: ['o'], stack: 's', firstSteps: ['f'], openQuestions: ['q'], risks: ['r'] }, costUsd: 0 };
+    if (opts.gold) return { value: { reason: 'r', originality: 5, feasibility: 5, impact: 5, keywords: ['k'] }, costUsd: 0 };
+    await failed;
+    throw new Error('429 Too Many Requests');
+  };
+  const root = mkdtempSync(join(tmpdir(), 'ideagen-failing-'));
+  const engine = createEngine({
+    repo, chat, gitInit: false,
+    settings: () => ({ ...structuredClone(DEFAULT_APP_SETTINGS), projectsRoot: root }),
+    ...(opts.writeProject ? { writeProject: opts.writeProject } : {}),
+  });
+  const old = repo.createBoard({ title: 'Gammal', config: { autoProjectOnGold: true } });
+  const idea = repo.insertIdea({ boardId: old.id, title: 'Sjungande bänk', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+  /** Delete the board; the next board and idea get the same ids. Watch the new board. */
+  const replace = () => {
+    engine.deleteBoard(old.id);
+    const next = repo.createBoard({ title: 'Ny' });
+    const own = repo.insertIdea({ boardId: next.id, title: 'Egen idé', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+    assert.equal(next.id, old.id);
+    assert.equal(own.id, idea.id);
+    const events: any[] = [];
+    engine.bus.on(next.id, (e: any) => events.push(e));
+    return { next, own, events };
+  };
+  return { repo, engine, idea, fail, replace };
+}
+
+test('a model call that fails after its board was deleted is board_deleted, and the queue publishes no error to the reused id', async () => {
+  const { repo, engine, idea, fail, replace } = failingSetup();
+  engine.queueJudge([idea.id]);
+  const direct = engine.judge(idea.id).then(() => null, (e: any) => e); // the same call, awaited here
+  await new Promise((r) => setTimeout(r, 10));
+  const { own, events } = replace();
+  fail();
+  const err = await direct;
+  await engine.idle();
+  assert.equal(err?.code, 'board_deleted', `not a 502: ${err?.code} ${err?.message}`);
+  assert.deepEqual(events, [], 'no judge error on the new board');
+  assert.equal(repo.getIdea(own.id)!.originality, null);
+  assert.equal(repo.spentOn(null), 0);
+});
+
+test('a project folder write that fails after the board was deleted is board_deleted: no project error on the reused idea', async () => {
+  let fail!: () => void;
+  const failed = new Promise<void>((r) => (fail = r));
+  const { repo, engine, idea, replace } = failingSetup({
+    gold: true,
+    writeProject: async () => { await failed; throw new Error('EACCES: permission denied'); },
+  });
+  const judging = engine.judge(idea.id).then(() => null, (e: any) => e);
+  await new Promise((r) => setTimeout(r, 10)); // judged gold, brief written, the folder write waits
+  const { own, events } = replace();
+  fail();
+  const err = await judging;
+  assert.equal(err?.code, 'board_deleted', `not a project error: ${err?.code} ${err?.message}`);
+  assert.deepEqual(events, [], 'the old idea is not published on the new board');
+  assert.equal(repo.getIdea(own.id)!.projectPath, null);
+});

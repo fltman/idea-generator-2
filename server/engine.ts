@@ -160,6 +160,9 @@ export function createEngine(deps: Deps) {
     try {
       out = await fn();
     } catch (e: any) {
+      // Failed after the board was deleted: the error is not this id's any more (it may be
+      // another board's now), so callers that skip board_deleted must see that, not a 502.
+      if (deletesOf(boardId) !== before) throw boardDeleted();
       if (e instanceof AppError) throw e;
       throw new AppError(502, e instanceof ProviderError ? e.code : 'llm_failed', e?.message ?? String(e));
     }
@@ -196,6 +199,7 @@ export function createEngine(deps: Deps) {
     try {
       path = await writeProject({ root: deps.settings().projectsRoot, brief, idea, goal: board.goal, lineage, lang, gitInit: deps.gitInit });
     } catch (e: any) {
+      stillThere(board.id, since, 'its project folder was being written'); // same as a model call failing late
       throw new AppError(500, 'project_failed', e?.message ?? String(e));
     }
     // Deleted while the folder was written: the idea's id may be another board's idea
