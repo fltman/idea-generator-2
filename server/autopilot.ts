@@ -131,11 +131,12 @@ export function createAutopilot(deps: { repo: Repo; engine: Engine; settings: ()
       // the step runs. Its result still counts toward the limits, but the status it shows
       // is manual, not a pace or backoff of an autopilot that is off. Every tick records
       // each board's mode in its state (st.auto), so the step reads that, not the DB.
-      // Or it outlasts the board itself. Board ids are reused (INTEGER PRIMARY KEY without
-      // AUTOINCREMENT): after the newest board is deleted, the next one gets its id. A
-      // deleted board's state was dropped from the map, so a step whose state is no longer
-      // the one kept for this id belongs to a board that is gone, and must not publish to,
-      // or count toward, a new board under the same id.
+      // Or it outlasts the board itself. Board ids can be reused (on a database whose
+      // AUTOINCREMENT rebuild was rolled back, see db.ts): after the newest board is
+      // deleted, the next one gets its id. A deleted board's state was dropped from the
+      // map, so a step whose state is no longer the one kept for this id belongs to a
+      // board that is gone, and must not publish to, or count toward, a new board under
+      // the same id.
       const mine = () => states.get(b.id) === st;
       engine
         .autoStep(b.id)

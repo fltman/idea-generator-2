@@ -23,7 +23,7 @@ export function follow(boardId, onEvent) {
   es.onmessage = (m) => {
     try {
       const e = JSON.parse(m.data);
-      // A deleted board's id goes to the next board created: never reconnect to it.
+      // A deleted board's id can go to the next board created: never reconnect to it.
       if (e.type === 'deleted') es.close();
       onEvent(e);
     } catch (e) {

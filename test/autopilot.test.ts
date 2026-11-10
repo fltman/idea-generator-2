@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { backoffMs, createAutopilot, nextLocalMidnight, rateCheck, type RateInput } from '../server/autopilot.ts';
 import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createBus, createEngine } from '../server/engine.ts';
 import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/providers.ts';
 
@@ -133,7 +134,7 @@ test('scheduler: a deleted board is forgotten, also while its step is still runn
 
 test('scheduler: a new board that reuses a deleted board\'s id starts clean, even while the old step still runs', async () => {
   for (const outcome of ['result', 'error'] as const) {
-    const repo = openDb(':memory:');
+    const repo = openDbReusingIds();
     let now = T;
     const { engine } = fakeEngineFor(repo);
     const finish: Array<() => void> = [];
@@ -155,7 +156,7 @@ test('scheduler: a new board that reuses a deleted board\'s id starts clean, eve
     ap.forget(old.id);
     repo.deleteBoard(old.id);
     const reused = repo.createBoard({ title: 'New', config });
-    assert.equal(reused.id, old.id, 'SQLite hands out the freed id again');
+    assert.equal(reused.id, old.id, 'the freed id is handed out again (reused-ids.ts)');
     assert.equal(ap.status(reused.id).state, 'manual', `${outcome}: no status carried over`);
 
     const seen: any[] = [];
@@ -196,7 +197,7 @@ test('scheduler: a board deleted without forget() is still dropped at the next t
 test('a deleted board\'s step that is still waiting on the model writes nothing into a new board with the same id', async () => {
   // Three ways an autoStep reaches the model: judging new ideas, expanding, combining.
   for (const scenario of ['judge', 'expand', 'combine'] as const) {
-    const repo = openDb(':memory:');
+    const repo = openDbReusingIds();
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const asked: string[] = [];

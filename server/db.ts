@@ -6,17 +6,11 @@
 import { DatabaseSync } from 'node:sqlite';
 import { medal, scoreSum } from '../public/js/score.js';
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS templates (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  system TEXT NOT NULL,
-  expand TEXT NOT NULL,
-  combine TEXT NOT NULL,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS boards (
-  id INTEGER PRIMARY KEY,
+// Boards and ideas never hand out a deleted one's id again (AUTOINCREMENT): a page,
+// an operation or a timer still holding that id must not reach the next board or idea.
+// Databases from before are rebuilt once by addAutoincrement() below.
+const BOARDS_TABLE = `(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   goal TEXT NOT NULL DEFAULT '',
   config TEXT NOT NULL DEFAULT '{}',
@@ -24,9 +18,9 @@ CREATE TABLE IF NOT EXISTS boards (
   summary TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ideas (
-  id INTEGER PRIMARY KEY,
+)`;
+const IDEAS_TABLE = `(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   pitch TEXT NOT NULL DEFAULT '',
@@ -45,7 +39,19 @@ CREATE TABLE IF NOT EXISTS ideas (
   origin_idea_id INTEGER REFERENCES ideas(id) ON DELETE SET NULL,
   origin_board_id INTEGER REFERENCES boards(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS templates (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  system TEXT NOT NULL,
+  expand TEXT NOT NULL,
+  combine TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS boards ${BOARDS_TABLE};
+CREATE TABLE IF NOT EXISTS ideas ${IDEAS_TABLE};
 CREATE INDEX IF NOT EXISTS ideas_board ON ideas(board_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ideas_guest_once ON ideas(board_id, origin_idea_id) WHERE origin_idea_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS edges (
@@ -330,11 +336,63 @@ const leadFromRow = (r: any): Lead => ({
   fetchedAt: r.fetched_at,
 });
 
+/**
+ * A database from before boards and ideas got AUTOINCREMENT: rebuild those two tables.
+ * SQLite cannot add AUTOINCREMENT to a table, so each one is created anew, filled with
+ * the old rows (ids kept), dropped and renamed, all in one transaction. The sequence
+ * starts above the highest id still there: a newest board or idea deleted before the
+ * rebuild is unknown to it, so its id can be handed out once more. Foreign keys are off meanwhile: the two tables reference each
+ * other, and edges, leads and idea_keywords reference them (the pragma cannot change
+ * inside a transaction). PRAGMA foreign_key_check must then find nothing, or the whole
+ * rebuild is rolled back: the database keeps reusing ids, which the deleted-board and
+ * deleted-idea guards still cover, and the rebuild is tried again at the next start.
+ */
+function addAutoincrement(db: DatabaseSync) {
+  const tables = { boards: BOARDS_TABLE, ideas: IDEAS_TABLE };
+  const old = (Object.keys(tables) as (keyof typeof tables)[]).filter(
+    (t) => !/\bAUTOINCREMENT\b/i.test((db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t) as any).sql),
+  );
+  if (!old.length) return;
+  const columns = (t: string) => (db.prepare(`PRAGMA table_info(${t})`).all() as any[]).map((c) => c.name as string);
+  let broken: any[] = [];
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.exec('BEGIN');
+    try {
+      for (const t of old) {
+        db.exec(`CREATE TABLE new_${t} ${tables[t]}`);
+        const had = columns(t);
+        const copied = columns(`new_${t}`).filter((c) => had.includes(c)).join(', ');
+        db.exec(`INSERT INTO new_${t} (${copied}) SELECT ${copied} FROM ${t}`);
+        db.exec(`DROP TABLE ${t}`);
+        db.exec(`ALTER TABLE new_${t} RENAME TO ${t}`);
+      }
+      db.exec(SCHEMA); // the indexes on ideas went with the old table
+      broken = db.prepare('PRAGMA foreign_key_check').all();
+      db.exec(broken.length ? 'ROLLBACK' : 'COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+  if (broken.length) {
+    const first = broken[0];
+    console.warn(
+      `Boards and ideas still reuse the ids of deleted ones: the database has ${broken.length} broken reference(s) ` +
+        `(the first: ${first.table} row ${first.rowid} → ${first.parent}), so the AUTOINCREMENT rebuild was rolled back. ` +
+        'It is tried again at the next start.',
+    );
+  }
+}
+
 export function openDb(file: string) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA foreign_keys = ON;');
   if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA);
+  addAutoincrement(db);
 
   if ((db.prepare('SELECT COUNT(*) AS n FROM templates').get() as any).n === 0) {
     const ins = db.prepare('INSERT INTO templates (name, system, expand, combine, sort) VALUES (?, ?, ?, ?, ?)');
@@ -405,9 +463,10 @@ export function openDb(file: string) {
         .map((r: any) => ({ ideaId: r.origin_idea_id, boardId: r.board_id, title: r.title }));
     },
     deleteBoard(id: number) {
-      // The spend ledger has no foreign key, and board ids are reused: left under this
-      // id, today's spend would count against the next board that gets it. It moves to
-      // board 0 (spend that belongs to no board), so totals and history keep it.
+      // The spend ledger has no foreign key, and board ids can be reused (see
+      // addAutoincrement): left under this id, today's spend would count against the
+      // next board that gets it. It moves to board 0 (spend that belongs to no board),
+      // so totals and history keep it.
       // Only for a board that exists: id 0 is that no-board ledger itself (moving it onto
       // itself and then deleting it would wipe it), and no other missing id has spend to move.
       if (!(id > 0) || !db.prepare('SELECT 1 FROM boards WHERE id = ?').get(id)) return false;

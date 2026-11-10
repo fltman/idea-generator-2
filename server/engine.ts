@@ -141,8 +141,9 @@ export function createEngine(deps: Deps) {
   const emitIdeas = (boardId: number, ideas: Idea[]) => ideas.length && bus.emit(boardId, { type: 'ideas', ideas });
 
   /** Every LLM call: spend lands on the board's ledger; failures become 502s that keep the provider's code. */
-  // Board ids are reused (INTEGER PRIMARY KEY without AUTOINCREMENT): once the newest
-  // board is deleted, the next board created gets its id, and the same goes for ideas.
+  // Board and idea ids can be reused. They are AUTOINCREMENT, but a database whose
+  // rebuild was rolled back (addAutoincrement in db.ts) still gives the newest deleted
+  // board's id to the next board created, and the same goes for ideas.
   // An operation that was waiting on the model when its board was deleted must not
   // write its result into whatever board holds that id now. Every delete of an id is
   // counted here. An operation reads the count when it starts (`since`) and passes it
@@ -198,7 +199,7 @@ export function createEngine(deps: Deps) {
 
   // ---------------------------------------------------------------- judging
 
-  // Idea ids are reused: a judgement only clears the entry it set, never one a later
+  // Idea ids can be reused: a judgement only clears the entry it set, never one a later
   // idea with the same id set after this idea's board was deleted.
   function setJudging(boardId: number, ids: number[], on: boolean, owner: symbol, emit = true) {
     for (const id of ids) {
@@ -408,7 +409,7 @@ export function createEngine(deps: Deps) {
       for (const [id, j] of judging) if (j.boardId === boardId) judging.delete(id);
       const deleted = repo.deleteBoard(boardId);
       // Pages still open on it hear that it is gone, then stop hearing this id at all:
-      // the next board created gets the same id, and its events are not theirs.
+      // the next board created can get the same id, and its events are not theirs.
       if (deleted) bus.emit(boardId, { type: 'deleted', boardId });
       bus.drop(boardId);
       return deleted;
@@ -437,7 +438,7 @@ export function createEngine(deps: Deps) {
 
     deleteIdea(ideaId: number) {
       const idea = repo.getIdea(ideaId);
-      // Idea ids are reused too: an operation still running on this idea must write
+      // Idea ids can be reused too: an operation still running on this idea must write
       // nothing into the next idea that gets its id (see call() and watch()).
       ideaDeletions.set(ideaId, ideaDeletesOf(ideaId) + 1);
       const ok = repo.deleteIdea(ideaId);

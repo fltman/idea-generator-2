@@ -1,7 +1,8 @@
 // The deleted-board flow in a real browser: two tabs of a headless Chrome on the same board,
 // driven over the DevTools protocol. Tab A deletes the board; tab B must close its stream,
 // say the board was deleted in another window and open another board, and neither tab may
-// hear anything from the next board that gets the deleted board's id. Also: a DELETE that
+// hear anything from the next board that gets the deleted board's id (the database reuses
+// ids, see reused-ids.ts). Also: a DELETE that
 // fails leaves A following the board, and deleting the last board opens the new-board dialog.
 // Skips when no Chrome/Chromium is found (set CHROME_PATH to point at one) or Node is older than 25.
 import { test } from 'node:test';
@@ -11,7 +12,7 @@ import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
 import { createHandler } from '../server/app.ts';
@@ -120,7 +121,7 @@ test('deleting a board with two tabs open on it, in headless Chrome: a failed de
   let settings: AppSettings = structuredClone(DEFAULT_APP_SETTINGS);
   let received = false;
   const runtime = { get: () => settings, set: (s: AppSettings) => { settings = s; received = true; }, received: () => received };
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   const engine = createEngine({ repo, settings: runtime.get, gitInit: false, chat: async () => { throw new Error('no model calls in this test'); } });
   const autopilot = createAutopilot({ repo, engine, settings: runtime.get });
   const server = createServer(createHandler({ repo, engine, autopilot, runtime, publicDir: join(import.meta.dirname, '..', 'public') }));

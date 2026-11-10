@@ -5,7 +5,7 @@ import { createServer, type Server } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
 import { createHandler } from '../server/app.ts';
@@ -52,7 +52,9 @@ let settings: AppSettings = { ...structuredClone(DEFAULT_APP_SETTINGS), projects
 let received = false;
 const runtime = { get: () => settings, set: (s: AppSettings) => { settings = s; received = true; }, received: () => received };
 
-const repo = openDb(':memory:');
+// Ids are reused, as on a database whose AUTOINCREMENT rebuild was rolled back: the delete tests
+// below check that nothing reaches the next board with the same id.
+const repo = openDbReusingIds();
 const revealed: string[] = [];
 let revealFails = false;
 const pages: Record<string, { title: string; text: string }> = {

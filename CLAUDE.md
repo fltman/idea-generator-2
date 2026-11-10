@@ -7,7 +7,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
   - Only Host headers naming this server are answered (DNS rebinding). `HOST=0.0.0.0` or `::` adds the address each connection arrived on (`req.socket.localAddress`) and the machine's own name from `os.hostname()`, plain and `.local` (mDNS), on our port.
   - Behind a port forward or proxy, list the names in `ALLOWED_HOSTS` (comma separated): a bare name is accepted on any port, `name:port` on that port only (a Host without a port matches `name:443`, for a TLS proxy). The Origin of a write must still equal the Host it was sent to.
-- `npm test` – 133 tests (`node --test`), fake LLM and fake provider servers, no network. `test/browser-deleted-board.test.ts` drives two tabs of a local headless Chrome over the DevTools protocol. It skips when no Chrome/Chromium is found (`CHROME_PATH` points at one) or Node is older than 25.
+- `npm test` – 136 tests (`node --test`), fake LLM and fake provider servers, no network. `test/browser-deleted-board.test.ts` drives two tabs of a local headless Chrome over the DevTools protocol. It skips when no Chrome/Chromium is found (`CHROME_PATH` points at one) or Node is older than 25.
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
@@ -27,6 +27,8 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `server/leads.ts` – the X and research scouts.
 - `server/project.ts` – Claude Code folders.
 - `server/db.ts` – SQLite (`node:sqlite`), plus `report()` and `dashboard()` queries.
+  - Boards and ideas have `AUTOINCREMENT` ids, so a deleted one's id is not handed out again. `openDb` rebuilds an older database once (`addAutoincrement`): foreign keys off, copy, drop, rename, then `foreign_key_check`, all in one transaction. With broken references it rolls back, warns, and that database keeps reusing ids.
+  - The deleted-board and deleted-idea guards stay for that case. Their tests use `test/reused-ids.ts`, a database that reuses ids the old way.
 - `server/app.ts` – HTTP, SSE (`/api/boards/:id/events`) and Markdown exports.
 - `public/js/score.js` and `public/js/evolve.js` – pure modules shared by the server, browser and tests.
 - `public/js/graph.js` – the canvas.

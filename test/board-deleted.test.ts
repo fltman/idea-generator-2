@@ -1,19 +1,20 @@
 // A board deleted while one of its operations waits on something else than the model
-// (a page, the paper list, the disk): board and idea ids are reused, so the operation
-// must write nothing into the new board that gets the same id.
+// (a page, the paper list, the disk). On a database that still reuses board and idea ids
+// (reused-ids.ts), the operation must write nothing into the new board that gets the same id.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createEngine } from '../server/engine.ts';
 import { writeProject } from '../server/project.ts';
 import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/providers.ts';
 
 /** An engine whose page fetch, paper fetch and project write each wait for release(). */
 function setup() {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   const asked: string[] = [];
   const chat = async (r: ChatRequest) => {
     asked.push(r.schemaName);
@@ -106,7 +107,7 @@ test('project folder: deleted while it is written, the folder stays, nothing is 
 });
 
 test('a board delete moves its spend to no board: the next board with that id starts at zero, totals keep it', () => {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   repo.addSpend(0, 0.1);
   const old = repo.createBoard({ title: 'Gammal' });
   repo.addSpend(old.id, 0.4);
@@ -136,7 +137,7 @@ test('board 0 (spend that belongs to no board) cannot be deleted: its spend stay
 });
 
 test('an old judgement on a deleted board does not clear the judging flag of a new idea with the same id', async () => {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   const releases: (() => void)[] = [];
   const chat = async (_r: ChatRequest) => {
     await new Promise<void>((r) => releases.push(r));
@@ -178,7 +179,7 @@ test('an old judgement on a deleted board does not clear the judging flag of a n
 
 /** A judge that waits for fail() or pass(), on a board with automatic projects. */
 function failingSetup(opts: { gold?: boolean; writeProject?: (a: any) => Promise<string> } = {}) {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   let fail!: () => void;
   const failed = new Promise<void>((r) => (fail = r));
   const chat = async (r: ChatRequest) => {
@@ -242,7 +243,7 @@ test('a project folder write that fails after the board was deleted is board_del
 });
 
 test('deleteBoard tells the board\'s listeners it is gone, then drops them: the next board with that id is not theirs', async () => {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   const engine = createEngine({ repo, chat: async () => { throw new Error('no model'); }, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
   const old = repo.createBoard({ title: 'Gammal' });
   const stale: any[] = [];

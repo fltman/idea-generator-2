@@ -1,18 +1,19 @@
-// An idea deleted on its own (its board stays) while an operation on it waits: idea ids
-// are reused, so the operation must write nothing into the next idea that gets the id.
+// An idea deleted on its own (its board stays) while an operation on it waits. On a database
+// that still reuses idea ids (reused-ids.ts), the operation must write nothing into the next
+// idea that gets the id.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createEngine } from '../server/engine.ts';
 import { writeProject } from '../server/project.ts';
 import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/providers.ts';
 
 /** An engine whose model calls (and project folder writes) wait for release(). */
 function setup(opts: { holdWrite?: boolean } = {}) {
-  const repo = openDb(':memory:');
+  const repo = openDbReusingIds();
   const asked: string[] = [];
   let release!: () => void;
   const held = new Promise<void>((r) => (release = r));
