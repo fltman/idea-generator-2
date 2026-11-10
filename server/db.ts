@@ -4,18 +4,13 @@
 // its jury guidance, its researchers, its autopilot pace. Templates only seed
 // a new board's flow; editing a board never changes another board.
 import { DatabaseSync } from 'node:sqlite';
+import { medal, scoreSum } from '../public/js/score.js';
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS templates (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  system TEXT NOT NULL,
-  expand TEXT NOT NULL,
-  combine TEXT NOT NULL,
-  sort INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS boards (
-  id INTEGER PRIMARY KEY,
+// Boards and ideas never hand out a deleted one's id again (AUTOINCREMENT): a page,
+// an operation or a timer still holding that id must not reach the next board or idea.
+// Databases from before are rebuilt once by addAutoincrement() below.
+const BOARDS_TABLE = `(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   goal TEXT NOT NULL DEFAULT '',
   config TEXT NOT NULL DEFAULT '{}',
@@ -23,9 +18,9 @@ CREATE TABLE IF NOT EXISTS boards (
   summary TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS ideas (
-  id INTEGER PRIMARY KEY,
+)`;
+const IDEAS_TABLE = `(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   pitch TEXT NOT NULL DEFAULT '',
@@ -44,7 +39,19 @@ CREATE TABLE IF NOT EXISTS ideas (
   origin_idea_id INTEGER REFERENCES ideas(id) ON DELETE SET NULL,
   origin_board_id INTEGER REFERENCES boards(id) ON DELETE SET NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)`;
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS templates (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  system TEXT NOT NULL,
+  expand TEXT NOT NULL,
+  combine TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS boards ${BOARDS_TABLE};
+CREATE TABLE IF NOT EXISTS ideas ${IDEAS_TABLE};
 CREATE INDEX IF NOT EXISTS ideas_board ON ideas(board_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ideas_guest_once ON ideas(board_id, origin_idea_id) WHERE origin_idea_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS edges (
@@ -299,6 +306,9 @@ const parseJson = (s: string) => {
 const BOARD_SELECT = `SELECT b.*, oi.title AS origin_idea_title, oi.board_id AS origin_board_id, ob.title AS origin_board_title
   FROM boards b LEFT JOIN ideas oi ON oi.id = b.origin_idea_id LEFT JOIN boards ob ON ob.id = oi.board_id`;
 
+/** Every board, most recently changed first: the board list and the report. */
+const BOARDS_IN_ORDER = `SELECT * FROM (${BOARD_SELECT}) b2 ORDER BY b2.updated_at DESC, b2.id DESC`;
+
 const boardFromRow = (r: any): Board => ({
   id: r.id,
   title: r.title,
@@ -326,11 +336,63 @@ const leadFromRow = (r: any): Lead => ({
   fetchedAt: r.fetched_at,
 });
 
+/**
+ * A database from before boards and ideas got AUTOINCREMENT: rebuild those two tables.
+ * SQLite cannot add AUTOINCREMENT to a table, so each one is created anew, filled with
+ * the old rows (ids kept), dropped and renamed, all in one transaction. The sequence
+ * starts above the highest id still there: a newest board or idea deleted before the
+ * rebuild is unknown to it, so its id can be handed out once more. Foreign keys are off meanwhile: the two tables reference each
+ * other, and edges, leads and idea_keywords reference them (the pragma cannot change
+ * inside a transaction). PRAGMA foreign_key_check must then find nothing, or the whole
+ * rebuild is rolled back: the database keeps reusing ids, which the deleted-board and
+ * deleted-idea guards still cover, and the rebuild is tried again at the next start.
+ */
+function addAutoincrement(db: DatabaseSync) {
+  const tables = { boards: BOARDS_TABLE, ideas: IDEAS_TABLE };
+  const old = (Object.keys(tables) as (keyof typeof tables)[]).filter(
+    (t) => !/\bAUTOINCREMENT\b/i.test((db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t) as any).sql),
+  );
+  if (!old.length) return;
+  const columns = (t: string) => (db.prepare(`PRAGMA table_info(${t})`).all() as any[]).map((c) => c.name as string);
+  let broken: any[] = [];
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.exec('BEGIN');
+    try {
+      for (const t of old) {
+        db.exec(`CREATE TABLE new_${t} ${tables[t]}`);
+        const had = columns(t);
+        const copied = columns(`new_${t}`).filter((c) => had.includes(c)).join(', ');
+        db.exec(`INSERT INTO new_${t} (${copied}) SELECT ${copied} FROM ${t}`);
+        db.exec(`DROP TABLE ${t}`);
+        db.exec(`ALTER TABLE new_${t} RENAME TO ${t}`);
+      }
+      db.exec(SCHEMA); // the indexes on ideas went with the old table
+      broken = db.prepare('PRAGMA foreign_key_check').all();
+      db.exec(broken.length ? 'ROLLBACK' : 'COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+  if (broken.length) {
+    const first = broken[0];
+    console.warn(
+      `Boards and ideas still reuse the ids of deleted ones: the database has ${broken.length} broken reference(s) ` +
+        `(the first: ${first.table} row ${first.rowid} → ${first.parent}), so the AUTOINCREMENT rebuild was rolled back. ` +
+        'It is tried again at the next start.',
+    );
+  }
+}
+
 export function openDb(file: string) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA foreign_keys = ON;');
   if (file !== ':memory:') db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA);
+  addAutoincrement(db);
 
   if ((db.prepare('SELECT COUNT(*) AS n FROM templates').get() as any).n === 0) {
     const ins = db.prepare('INSERT INTO templates (name, system, expand, combine, sort) VALUES (?, ?, ?, ?, ?)');
@@ -355,9 +417,7 @@ export function openDb(file: string) {
     // ---- boards
     listBoards() {
       return db
-        .prepare(
-          `SELECT * FROM (${BOARD_SELECT}) b2 ORDER BY b2.updated_at DESC, b2.id DESC`,
-        )
+        .prepare(BOARDS_IN_ORDER)
         .all()
         .map((r: any) => ({
           ...boardFromRow(r),
@@ -403,7 +463,21 @@ export function openDb(file: string) {
         .map((r: any) => ({ ideaId: r.origin_idea_id, boardId: r.board_id, title: r.title }));
     },
     deleteBoard(id: number) {
-      return db.prepare('DELETE FROM boards WHERE id = ?').run(id).changes > 0;
+      // The spend ledger has no foreign key, and board ids can be reused (see
+      // addAutoincrement): left under this id, today's spend would count against the
+      // next board that gets it. It moves to board 0 (spend that belongs to no board),
+      // so totals and history keep it.
+      // Only for a board that exists: id 0 is that no-board ledger itself (moving it onto
+      // itself and then deleting it would wipe it), and no other missing id has spend to move.
+      if (!(id > 0) || !db.prepare('SELECT 1 FROM boards WHERE id = ?').get(id)) return false;
+      return tx(() => {
+        db.prepare(
+          `INSERT INTO spend (board_id, day, usd, calls) SELECT 0, day, usd, calls FROM spend WHERE board_id = ?
+           ON CONFLICT(board_id, day) DO UPDATE SET usd = usd + excluded.usd, calls = calls + excluded.calls`,
+        ).run(id);
+        db.prepare('DELETE FROM spend WHERE board_id = ?').run(id);
+        return db.prepare('DELETE FROM boards WHERE id = ?').run(id).changes > 0;
+      });
     },
 
     // ---- ideas
@@ -466,38 +540,52 @@ export function openDb(file: string) {
      * boards, mean jury sum, ideas in the last `days` vs the `days` before, and
      * a per-day count series for the last `days`.
      */
-    dashboard(days = 30, limit = 40) {
-      const since = `-${days} days`;
-      const before = `-${days * 2} days`;
+    dashboard(daysAsked = 30, limit = 40) {
+      const days = wholeDays(daysAsked); // also sizes the "previous" period below
+      // Days are local, like spend and the dollar limits: an idea made just after
+      // local midnight counts on the new day, wherever UTC's date line falls.
+      // "Recent" is the shown days, from local midnight of the first one; "previous"
+      // is the same number of whole local days before that.
+      const dayList = localDays(days);
+      const ranges = localDayRanges(dayList);
+      const since = ranges[0][0];
+      const until = ranges[ranges.length - 1][1];
+      const first = localMidnight(dayList[0]); // the first shown day (not firstLocalDay(): no second clock read)
+      const before = sqlUtc(new Date(first.getFullYear(), first.getMonth(), first.getDate() - days));
       const rows = db
         .prepare(
           `SELECT k.keyword,
              COUNT(*) AS count,
              COUNT(DISTINCT i.board_id) AS boards,
              AVG(i.originality + i.feasibility + i.impact) AS mean_sum,
-             SUM(i.created_at >= datetime('now', ?)) AS recent,
-             SUM(i.created_at < datetime('now', ?) AND i.created_at >= datetime('now', ?)) AS previous
+             SUM(i.created_at >= ?) AS recent,
+             SUM(i.created_at < ? AND i.created_at >= ?) AS previous
            FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
            GROUP BY k.keyword
            ORDER BY recent DESC, count DESC, k.keyword
            LIMIT ?`,
         )
         .all(since, since, before, limit) as any[];
+      // The series covers only the keywords shown. The day boundaries come from JS:
+      // SQLite's 'localtime' reads the zone once per process, while JS follows TZ, and
+      // JS steps whole calendar days across a DST change. Day n is ranges[n] = [start, stop).
+      // SQLite counts each keyword's ideas per instant inside the window; JS puts each
+      // instant on its day by binary search over the day starts, log2(days) steps a
+      // row. (A range join against the days had no index: every row met every day.)
       const seriesRows = db
         .prepare(
-          `SELECT k.keyword, substr(i.created_at, 1, 10) AS day, COUNT(*) AS n
-           FROM idea_keywords k JOIN ideas i ON i.id = k.idea_id
-           WHERE i.created_at >= datetime('now', ?)
-           GROUP BY k.keyword, day`,
+          `SELECT k.keyword, i.created_at AS at, COUNT(*) AS count
+           FROM idea_keywords k
+           JOIN ideas i ON i.id = k.idea_id
+           WHERE i.created_at >= ? AND i.created_at < ? AND k.keyword IN (SELECT value FROM json_each(?))
+           GROUP BY k.keyword, i.created_at`,
         )
-        .all(since) as any[];
-      const dayList: string[] = [];
-      for (let d = days - 1; d >= 0; d--) dayList.push(new Date(Date.now() - d * 86_400_000).toISOString().slice(0, 10));
+        .all(since, until, JSON.stringify(rows.map((r) => r.keyword))) as any[];
+      const starts = ranges.map(([start]) => start);
       const series = new Map<string, number[]>();
       for (const r of seriesRows) {
         if (!series.has(r.keyword)) series.set(r.keyword, dayList.map(() => 0));
-        const at = dayList.indexOf(r.day);
-        if (at >= 0) series.get(r.keyword)![at] = r.n;
+        series.get(r.keyword)![dayOf(starts, r.at)] += r.count;
       }
       const boards = db
         .prepare(
@@ -516,7 +604,7 @@ export function openDb(file: string) {
         .prepare(
           `SELECT (SELECT COUNT(*) FROM ideas) AS ideas, (SELECT COUNT(*) FROM boards) AS boards,
                   (SELECT COUNT(DISTINCT keyword) FROM idea_keywords) AS keywords,
-                  (SELECT COUNT(*) FROM ideas WHERE created_at >= datetime('now', ?)) AS recent`,
+                  (SELECT COUNT(*) FROM ideas WHERE created_at >= ?) AS recent`,
         )
         .get(since) as any;
       return {
@@ -651,40 +739,41 @@ export function openDb(file: string) {
      * Everything the report window shows for the last `days` days: totals,
      * every Claude Code project, and per board its goal, summary, best ideas.
      */
-    report(days = 30) {
-      const since = `-${days} days`;
-      const boards = repo.listBoards();
+    report(daysAsked = 30) {
+      const days = wholeDays(daysAsked); // the period, and the days the report says it covers
+      // The period is whole local days, from local midnight of the first one: the
+      // same days the dashboard shows and spend is booked on.
+      const firstDay = firstLocalDay(days);
+      // Boards without listBoards()' per-board idea counts: the report counts each
+      // board's ideas from its own list.
+      const boards = (db.prepare(BOARDS_IN_ORDER).all() as any[]).map(boardFromRow);
+      // One read of the ideas table. created_at is SQLite's UTC text, which sorts like
+      // the instant it names, so comparing it here is the comparison SQLite would make.
       const ideas = (db.prepare(`${IDEA_SELECT} ORDER BY i.id`).all() as any[]).map(ideaFromRow);
-      const recentIds = new Set(
-        (db.prepare(`SELECT id FROM ideas WHERE created_at >= datetime('now', ?)`).all(since) as any[]).map((r) => r.id),
-      );
-      const sum = (i: Idea) => (i.originality == null ? null : i.originality + i.feasibility! + i.impact!);
-      const medalOf = (i: Idea) => {
-        if (i.medalOverride != null) return i.medalOverride;
-        const s = sum(i);
-        return s == null ? null : s >= 13 ? 3 : s >= 11 ? 2 : s >= 9 ? 1 : 0;
-      };
-      const rank = (x: Idea, y: Idea) => (sum(y) ?? -1) - (sum(x) ?? -1) || y.id - x.id;
-      const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: sum(i), medal: medalOf(i), reason: i.reason, kind: i.kind });
+      const since = sqlUtc(localMidnight(firstDay));
+      const isNew = (i: Idea) => i.createdAt >= since;
+      // Sums and medals come from score.js, like everywhere else: it holds the thresholds, and a hand-set medal wins.
+      const rank = (x: Idea, y: Idea) => (scoreSum(y) ?? -1) - (scoreSum(x) ?? -1) || y.id - x.id;
+      const brief = (i: Idea) => ({ id: i.id, boardId: i.boardId, title: i.title, pitch: i.pitch, sum: scoreSum(i), medal: medal(i), reason: i.reason, kind: i.kind });
       const title = new Map(boards.map((b) => [b.id, b.title]));
       const projects = ideas
         .filter((i) => i.projectPath)
         .map((i) => ({ ...brief(i), boardTitle: title.get(i.boardId) ?? '', path: i.projectPath! }));
       const medals = { gold: 0, silver: 0, bronze: 0 };
       for (const i of ideas) {
-        const m = medalOf(i);
+        const m = medal(i);
         if (m === 3) medals.gold++;
         else if (m === 2) medals.silver++;
         else if (m === 1) medals.bronze++;
       }
-      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(localDay(new Date(Date.now() - (days - 1) * 86_400_000)));
+      const spent: any = db.prepare(`SELECT SUM(usd) AS usd FROM spend WHERE day >= ?`).get(firstDay);
       const latest: any = db.prepare('SELECT * FROM reports ORDER BY id DESC LIMIT 1').get();
       return {
         days,
         totals: {
           boards: boards.length,
           ideas: ideas.length,
-          newIdeas: recentIds.size,
+          newIdeas: ideas.filter(isNew).length,
           judged: ideas.filter((i) => i.judgedAt).length,
           medals,
           projects: projects.length,
@@ -695,8 +784,8 @@ export function openDb(file: string) {
           const own = ideas.filter((i) => i.boardId === b.id);
           return {
             id: b.id, title: b.title, goal: b.goal, mode: b.config.mode,
-            ideaCount: own.length, newIdeas: own.filter((i) => recentIds.has(i.id)).length,
-            best: own.filter((i) => sum(i) != null || i.medalOverride != null).sort(rank).slice(0, 3).map(brief),
+            ideaCount: own.length, newIdeas: own.filter(isNew).length,
+            best: own.filter((i) => scoreSum(i) != null || i.medalOverride != null).sort(rank).slice(0, 3).map(brief),
             summary: b.summary ? { ...b.summary, stale: b.summary.ideaCount !== own.length } : null,
             projects: projects.filter((p) => p.boardId === b.id),
           };
@@ -736,3 +825,69 @@ export type Repo = ReturnType<typeof openDb>;
 export function localDay(d = new Date()) {
   return d.toLocaleDateString('sv-SE');
 }
+
+/**
+ * A number of days as a whole count, at least 1. new Date(y, m, d - k) truncates a
+ * fractional k, so 2.5 days would step back to yesterday and leave today out of the
+ * period. Every function here that takes a number of days rounds it with this, so a
+ * caller that skips the HTTP clamp (clampDays in app.ts) gets the same days.
+ */
+export function wholeDays(days: number) {
+  return Math.max(1, Math.round(days) || 1);
+}
+
+/** The local day k calendar days before `now`'s: a calendar step, so a DST change never skips or repeats a day. */
+const dayBefore = (now: Date, k: number) => localDay(new Date(now.getFullYear(), now.getMonth(), now.getDate() - k));
+
+/** The last `days` local calendar days, oldest first, ending today. */
+export function localDays(days: number, now = new Date()) {
+  const out: string[] = [];
+  for (let k = wholeDays(days) - 1; k >= 0; k--) out.push(dayBefore(now, k));
+  return out;
+}
+
+/** The first of localDays(days), without building the others. */
+export function firstLocalDay(days: number, now = new Date()) {
+  return dayBefore(now, wholeDays(days) - 1);
+}
+
+/** The instant a local day (YYYY-MM-DD) begins. */
+function localMidnight(day: string) {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+/**
+ * Each local day as its [start, stop) instants in SQLite's UTC format. A day stops
+ * where the next one starts, so a list of consecutive days leaves no gap and no
+ * overlap; across a DST change a day is 23 or 25 hours long.
+ */
+export function localDayRanges(dayList: string[]): [string, string][] {
+  return dayList.map((day) => {
+    const start = localMidnight(day);
+    return [sqlUtc(start), sqlUtc(new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1))];
+  });
+}
+
+/**
+ * The day an instant falls on: the index of the last start at or before `at`, by
+ * binary search over consecutive day starts (each day stops where the next begins),
+ * or -1 before the first. Plain string order, as SQLite compares these ASCII
+ * timestamps, so a row lands on the same day the SQL range test would put it on.
+ */
+export function dayOf(starts: string[], at: string): number {
+  let lo = 0;
+  let hi = starts.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (starts[mid] <= at) {
+      found = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found;
+}
+
+/** SQLite's datetime('now') format, which is UTC: "YYYY-MM-DD HH:MM:SS". */
+const sqlUtc = (d: Date) => d.toISOString().slice(0, 19).replace('T', ' ');

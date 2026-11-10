@@ -22,7 +22,10 @@ export function follow(boardId, onEvent) {
   const es = new EventSource(`/api/boards/${boardId}/events`);
   es.onmessage = (m) => {
     try {
-      onEvent(JSON.parse(m.data));
+      const e = JSON.parse(m.data);
+      // A deleted board's id can go to the next board created: never reconnect to it.
+      if (e.type === 'deleted') es.close();
+      onEvent(e);
     } catch (e) {
       console.error('bad event', e);
     }

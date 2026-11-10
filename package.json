@@ -9,12 +9,13 @@
     "node": ">=25"
   },
   "scripts": {
-    "start": "node server/index.ts",
-    "dev": "node --watch-path=server --watch-path=public/js/score.js --watch-path=public/js/evolve.js server/index.ts",
+    "start": "node server/require-node-25.js && node server/index.ts",
+    "dev": "node server/require-node-25.js && node --watch-path=server --watch-path=public/js/score.js --watch-path=public/js/evolve.js server/index.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "calibrate": "node tools/calibrate-judge.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^1.3.0"
+    "@anthropic-ai/sdk": "^1.3.0",
+    "undici": "^7.30.2"
   }
 }

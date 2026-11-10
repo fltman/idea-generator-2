@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { backoffMs, createAutopilot, nextLocalMidnight, rateCheck, type RateInput } from '../server/autopilot.ts';
 import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createBus, createEngine } from '../server/engine.ts';
 import { DEFAULT_APP_SETTINGS, type ChatRequest } from '../server/providers.ts';
 
@@ -98,6 +99,163 @@ test('scheduler: only auto boards run, at their pace, within their limits', asyn
   assert.equal(ap.status(auto.id).state, 'manual');
 });
 
+test('scheduler: a deleted board is forgotten, also while its step is still running', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine, steps } = fakeEngineFor(repo);
+  const ap = createAutopilot({ repo, engine, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const config = { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } };
+  const keep = repo.createBoard({ title: 'Keep', config });
+  const gone = repo.createBoard({ title: 'Gone', config });
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+
+  await ap.tick(); await flush();
+  assert.deepEqual(ap.tracked().sort(), [keep.id, gone.id].sort());
+  assert.equal(ap.status(gone.id).state, 'pace');
+
+  repo.deleteBoard(gone.id);
+  now += 20_000; await ap.tick(); await flush();
+  assert.deepEqual(ap.tracked(), [keep.id], 'the deleted board has no state left');
+  assert.equal(ap.status(gone.id).state, 'manual');
+  assert.ok(!steps.slice(2).includes(gone.id), 'and no step ran for it');
+
+  // Deleted between the start of a step and its result: the late result does not bring the entry back.
+  let release!: () => void;
+  const slow = { ...engine, autoStep: (id: number) => new Promise<{ did: 'combine' }>((r) => { release = () => r({ did: 'combine' }); steps.push(id); }) };
+  const ap2 = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  await ap2.tick();
+  assert.equal(ap2.status(keep.id).state, 'running');
+  repo.deleteBoard(keep.id);
+  await ap2.tick();
+  release(); await flush();
+  await ap2.tick();
+  assert.deepEqual(ap2.tracked(), []);
+});
+
+test('scheduler: a new board that reuses a deleted board\'s id starts clean, even while the old step still runs', async () => {
+  for (const outcome of ['result', 'error'] as const) {
+    const repo = openDbReusingIds();
+    let now = T;
+    const { engine } = fakeEngineFor(repo);
+    const finish: Array<() => void> = [];
+    const slow = {
+      ...engine,
+      autoStep: () => new Promise<{ did: 'combine' }>((ok, fail) => {
+        finish.push(() => (outcome === 'result' ? ok({ did: 'combine' }) : fail(Object.assign(new Error('no key'), { code: 'no_key' }))));
+      }),
+    };
+    const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+    const config = { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 1, usdPerDay: 100 } };
+    const old = repo.createBoard({ title: 'Old', config });
+    const flush = () => new Promise((r) => setTimeout(r, 5));
+
+    await ap.tick();
+    assert.equal(ap.status(old.id).state, 'running', `${outcome}: the old board's step is under way`);
+
+    // Deleted mid-step, as the DELETE route does it; the next board gets the same id.
+    ap.forget(old.id);
+    repo.deleteBoard(old.id);
+    const reused = repo.createBoard({ title: 'New', config });
+    assert.equal(reused.id, old.id, 'the freed id is handed out again (reused-ids.ts)');
+    assert.equal(ap.status(reused.id).state, 'manual', `${outcome}: no status carried over`);
+
+    const seen: any[] = [];
+    engine.bus.on(reused.id, (e: any) => seen.push(e.status));
+    finish[0](); await flush();
+    assert.deepEqual(seen, [], `${outcome}: the old step publishes nothing on the new board`);
+    assert.equal(ap.status(reused.id).state, 'manual');
+
+    // The new board runs a step of its own at once: no hour of steps (limit 1), no
+    // error backoff and no last result from the old board.
+    await ap.tick();
+    assert.equal(finish.length, 2, `${outcome}: the new board's own first step started`);
+    assert.equal(ap.status(reused.id).state, 'running');
+    assert.equal(ap.status(reused.id).last, undefined, `${outcome}: no last result from the old board`);
+    assert.equal(ap.status(reused.id).stepsLastHour, 0, `${outcome}: the old step is not in the new board's hour`);
+    finish[1](); await flush();
+  }
+});
+
+test('scheduler: a board deleted without forget() is still dropped at the next tick, busy or not', async () => {
+  const repo = openDb(':memory:');
+  const { engine } = fakeEngineFor(repo);
+  let release!: () => void;
+  const slow = { ...engine, autoStep: () => new Promise<{ did: 'combine' }>((r) => { release = () => r({ did: 'combine' }); }) };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => T });
+  const board = repo.createBoard({ title: 'B', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap.tick();
+  repo.deleteBoard(board.id);
+  await ap.tick();
+  assert.deepEqual(ap.tracked(), [], 'dropped while its step runs');
+  const seen: any[] = [];
+  engine.bus.on(board.id, (e: any) => seen.push(e));
+  release(); await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(seen, [], 'and its late result goes nowhere');
+  assert.deepEqual(ap.tracked(), []);
+});
+
+test('a deleted board\'s step that is still waiting on the model writes nothing into a new board with the same id', async () => {
+  // Three ways an autoStep reaches the model: judging new ideas, expanding, combining.
+  for (const scenario of ['judge', 'expand', 'combine'] as const) {
+    const repo = openDbReusingIds();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const asked: string[] = [];
+    const chat = async (r: ChatRequest) => {
+      asked.push(r.schemaName);
+      await held;
+      const value =
+        r.schemaName === 'expand' ? { ideas: [1, 2].map((k) => ({ title: `Gammal ${k}`, pitch: 'p' })) }
+        : r.schemaName === 'judgement' ? { reason: 'r', originality: 5, feasibility: 5, impact: 5, keywords: ['gammal'] }
+        : { title: 'Gammal korsning', pitch: 'p' };
+      return { value, costUsd: 0.25 };
+    };
+    const engine = createEngine({ repo, chat, settings: () => DEFAULT_APP_SETTINGS, gitInit: false });
+    const old = repo.createBoard({ title: 'Gammal', config: { autoProjectOnGold: true } });
+    const count = scenario === 'combine' ? 3 : 1;
+    const oldIdeas = Array.from({ length: count }, (_, k) =>
+      repo.insertIdea({ boardId: old.id, title: `Frö ${k}`, pitch: 'p', kind: 'seed', x: k * 200, y: 0, generation: 0 }));
+    if (scenario !== 'judge') for (const i of oldIdeas) repo.saveJudgement(i.id, { originality: 3, feasibility: 3, impact: 3, reason: 'r' });
+    // A combine needs every idea expanded once already: give each a judged child.
+    if (scenario === 'combine') for (const p of oldIdeas) {
+      const c = repo.insertIdea({ boardId: old.id, title: `Barn ${p.id}`, pitch: 'p', kind: 'expand', x: 0, y: 99, generation: 1 }, [p.id]);
+      repo.saveJudgement(c.id, { originality: 3, feasibility: 3, impact: 3, reason: 'r' });
+    }
+
+    // nextMove expands instead of combining on a random 20% ("mutation"): pin the dice
+    // while the step picks its move, so each scenario reaches the call it is named after.
+    const random = Math.random;
+    Math.random = () => 0.5;
+    let step: Promise<any>;
+    try {
+      step = engine.autoStep(old.id).then(() => null, (e: any) => e);
+      await new Promise((r) => setTimeout(r, 10)); // waiting on the model now
+    } finally {
+      Math.random = random;
+    }
+    assert.deepEqual(asked, [scenario === 'judge' ? 'judgement' : scenario], `${scenario}: the step is waiting on that call`);
+
+    engine.deleteBoard(old.id);
+    const reused = repo.createBoard({ title: 'Ny', config: { autoProjectOnGold: true } });
+    assert.equal(reused.id, old.id, 'the id is handed out again');
+    const own = repo.insertIdea({ boardId: reused.id, title: 'Egen idé', pitch: 'p', kind: 'seed', x: 0, y: 0, generation: 0 });
+    assert.equal(own.id, oldIdeas[0].id, 'and so is an idea id');
+    const events: any[] = [];
+    engine.bus.on(reused.id, (e: any) => events.push(e));
+
+    release();
+    const err = await step;
+    await engine.idle();
+    assert.equal(err?.code, 'board_deleted', `${scenario}: the step ends with board_deleted`);
+    assert.deepEqual(repo.listIdeas(reused.id).map((i) => i.title), ['Egen idé'], `${scenario}: no idea from the old board`);
+    assert.equal(repo.getIdea(own.id)!.originality, null, `${scenario}: the new board's idea was not judged by the old step`);
+    assert.deepEqual(repo.listEdges(reused.id), [], `${scenario}: no edges`);
+    assert.deepEqual(events, [], `${scenario}: nothing published on the new board`);
+    assert.equal(repo.spentOn(reused.id), 0, `${scenario}: the new board is not charged`);
+    assert.ok(repo.spentOn(null) > 0, `${scenario}: the spend still counts toward the global limit`);
+  }
+});
+
 test('autoStep with the real engine: judge first, grow a small pool, then breed', async () => {
   const repo = openDb(':memory:');
   let n = 0;
@@ -122,4 +280,123 @@ test('autoStep with the real engine: judge first, grow a small pool, then breed'
   const ideas = repo.listIdeas(board.id);
   assert.ok(ideas.every((i) => i.judgedAt), 'every step leaves its ideas judged');
   assert.ok(ideas.some((i) => i.kind === 'combine' && i.generation >= 2));
+});
+
+test('scheduler: switching a board to manual and back neither doubles a running step nor resets its limits', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let started = 0;
+  let running = 0;
+  let release!: () => void;
+  const slow = {
+    ...engine,
+    autoStep: () => {
+      started++;
+      running++;
+      return new Promise<{ did: 'combine' }>((r) => { release = () => { running--; r({ did: 'combine' }); }; });
+    },
+  };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'Toggle', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 1, usdPerDay: 100 } } });
+  const mode = (id: number, m: 'auto' | 'manual') => repo.updateBoard(id, { config: { mode: m } });
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+
+  await ap.tick();
+  assert.equal(started, 1);
+  mode(board.id, 'manual'); await ap.tick();
+  mode(board.id, 'auto'); now += 1_000; await ap.tick();
+  assert.equal(started, 1, 'no second step beside the one still running');
+  assert.equal(running, 1);
+  assert.equal(ap.status(board.id).state, 'running');
+  release(); await flush();
+
+  // That step used the hour's one step, and a round trip through manual does not hand it back.
+  mode(board.id, 'manual'); await ap.tick();
+  assert.equal(ap.status(board.id).state, 'manual');
+  mode(board.id, 'auto'); now += 60_000; await ap.tick(); await flush();
+  assert.equal(started, 1);
+  assert.equal(ap.status(board.id).state, 'hourly');
+
+  // The error backoff survives a toggle too.
+  mode(board.id, 'manual');
+  const failing = fakeEngineFor(repo);
+  failing.setFail(true);
+  const ap2 = createAutopilot({ repo, engine: failing.engine, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const other = repo.createBoard({ title: 'Fails', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap2.tick(); await flush();
+  assert.equal(ap2.status(other.id).state, 'error');
+  failing.setFail(false);
+  mode(other.id, 'manual'); await ap2.tick();
+  mode(other.id, 'auto'); now += 15_000; await ap2.tick(); await flush();
+  assert.equal(ap2.status(other.id).state, 'backoff', 'still backing off');
+  assert.equal(failing.steps.length, 0);
+});
+
+test('scheduler: a step that ends after the board went manual shows manual, and the last result is kept', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let settle!: { ok: () => void; fail: () => void };
+  const slow = {
+    ...engine,
+    autoStep: () => new Promise<{ did: 'combine' }>((ok, fail) => {
+      settle = { ok: () => ok({ did: 'combine' }), fail: () => fail(Object.assign(new Error('no key'), { code: 'no_key' })) };
+    }),
+  };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'Late', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  // As the PATCH route does: save the mode, then tell the autopilot.
+  const mode = (m: 'auto' | 'manual') => { repo.updateBoard(board.id, { config: { mode: m } }); ap.modeChanged(board.id, m); };
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+  const shown: string[] = [];
+  engine.bus.on(board.id, (e: any) => { if (e.type === 'autopilot') shown.push(e.status.state); });
+
+  // A step succeeds after the board went manual, before the next tick noticed.
+  await ap.tick();
+  mode('manual');
+  settle.ok(); await flush();
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
+  await ap.tick();
+  assert.deepEqual(shown, ['running', 'manual'], 'no pace for an autopilot that is off, and manual only once');
+
+  // Back on auto: it paces from that step, and still shows what it did last.
+  mode('auto'); now += 1_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'pace');
+  assert.equal(ap.status(board.id).last, 'combine');
+
+  // A step fails after the board went manual: no error status, but the backoff still counts.
+  now += 20_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'running');
+  mode('manual');
+  settle.fail(); await flush();
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
+  assert.ok(!shown.includes('error'));
+  mode('auto'); now += 1_000; await ap.tick();
+  assert.equal(ap.status(board.id).state, 'backoff');
+  assert.equal(ap.status(board.id).last, 'combine', 'the last result survives manual, error and backoff');
+});
+
+test('scheduler: a finishing step reads the mode the tick recorded, not the board from the DB', async () => {
+  const repo = openDb(':memory:');
+  let now = T;
+  const { engine } = fakeEngineFor(repo);
+  let settle!: () => void;
+  const slow = { ...engine, autoStep: () => new Promise<{ did: 'combine' }>((ok) => { settle = () => ok({ did: 'combine' }); }) };
+  const ap = createAutopilot({ repo, engine: slow, settings: () => DEFAULT_APP_SETTINGS, now: () => now });
+  const board = repo.createBoard({ title: 'B', config: { mode: 'auto', autopilotSeconds: 10, rate: { stepsPerHour: 60, usdPerDay: 100 } } });
+  await ap.tick();
+  // Switched to manual some other way than the route (no modeChanged): the next tick sees it.
+  repo.updateBoard(board.id, { config: { mode: 'manual' } });
+  await ap.tick();
+  let reads = 0;
+  const getBoard = repo.getBoard;
+  repo.getBoard = (id: number) => (reads++, getBoard(id));
+  try {
+    settle(); await new Promise((r) => setTimeout(r, 5));
+  } finally {
+    repo.getBoard = getBoard;
+  }
+  assert.equal(reads, 0, 'the step result reads no board');
+  assert.deepEqual(ap.status(board.id), { state: 'manual', last: 'combine' });
 });

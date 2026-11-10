@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fetchPapers, normalizeUrl } from '../server/leads.ts';
 import { expandHome, renderClaudeMd, slugify, writeProject, type Brief } from '../server/project.ts';
+import { revealInFileManager } from '../server/engine.ts';
 
 test('URLs compare loosely: www, twitter.com = x.com, query and trailing slash ignored', () => {
   assert.equal(normalizeUrl('https://twitter.com/a/status/1?s=20'), normalizeUrl('https://x.com/a/status/1/'));
@@ -37,6 +38,49 @@ test('slugs are ASCII; ~ expands to home', () => {
   assert.equal(slugify('!!!'), 'idea');
   assert.equal(expandHome('~/x'), join(homedir(), 'x'));
   assert.equal(expandHome('/abs'), '/abs');
+  assert.equal(expandHome('~\\x', 'win32'), join(homedir(), '\\x'), 'Windows: ~\\ is home too');
+  assert.equal(expandHome('~\\x', 'linux'), '~\\x', 'elsewhere a backslash is part of the name');
+});
+
+type Run = (cmd: string, args: string[], options: { windowsVerbatimArguments?: boolean }, done: (e: any) => void) => void;
+const runner = (err: any, seen: string[][] = [], opts: object[] = []): Run => (cmd, args, options, done) => {
+  seen.push([cmd, ...args]);
+  opts.push(options);
+  setImmediate(() => done(err));
+};
+
+test('reveal on Windows: the path is quoted and passed verbatim, so Explorer does not split it at a comma', async () => {
+  const seen: string[][] = [];
+  const opts: object[] = [];
+  await revealInFileManager('E:\\a,b\\proj', 'win32', runner(null, seen, opts));
+  await revealInFileManager('C:\\Users\\me\\x y,z\\proj', 'win32', runner(null, seen, opts));
+  assert.deepEqual(seen, [['explorer', '"E:\\a,b\\proj"'], ['explorer', '"C:\\Users\\me\\x y,z\\proj"']]);
+  assert.deepEqual(opts, [{ windowsVerbatimArguments: true }, { windowsVerbatimArguments: true }], 'Node must not escape the quotes');
+
+  // Elsewhere the path is one argv entry as it is; commas mean nothing there.
+  const other: string[][] = [];
+  const otherOpts: object[] = [];
+  await revealInFileManager('/srv/a,b', 'linux', runner(null, other, otherOpts));
+  assert.deepEqual(other, [['xdg-open', '/srv/a,b']]);
+  assert.deepEqual(otherOpts, [{}]);
+
+  const ran: string[][] = [];
+  await assert.rejects(revealInFileManager('E:\\a"b', 'win32', runner(null, ran)), /contains a quote/);
+  assert.deepEqual(ran, [], 'a quote in the path never reaches Explorer');
+});
+
+test('reveal: a missing or failing opener is reported, Explorer\'s exit code 1 is not', async () => {
+  const seen: string[][] = [];
+  await revealInFileManager('/p', 'linux', runner(null, seen));
+  await revealInFileManager('/p', 'darwin', runner(null, seen));
+  await revealInFileManager('E:\\p', 'win32', runner(Object.assign(new Error('exit 1'), { code: 1 }), seen));
+  assert.deepEqual(seen, [['xdg-open', '/p'], ['open', '/p'], ['explorer', '"E:\\p"']]);
+
+  const missing = Object.assign(new Error('spawn xdg-open ENOENT'), { code: 'ENOENT' });
+  await assert.rejects(revealInFileManager('/p', 'linux', runner(missing)), /xdg-open is not installed/);
+  await assert.rejects(revealInFileManager('E:\\p', 'win32', runner(Object.assign(new Error('spawn explorer ENOENT'), { code: 'ENOENT' }))), /explorer is not installed/);
+  await assert.rejects(revealInFileManager('/p', 'linux', runner(Object.assign(new Error('exit 4'), { code: 4 }))), /xdg-open failed \(exit 4\)/);
+  await assert.rejects(revealInFileManager('/p', 'darwin', runner(Object.assign(new Error('exit 1'), { code: 1 }))), /open failed \(exit 1\)/);
 });
 
 const brief: Brief = {
@@ -65,6 +109,6 @@ test('project folders never overwrite: a taken name gets -2', async () => {
   const b = await writeProject({ root, brief, idea, goal: '', lineage: [], lang: 'en', gitInit: false });
   assert.deepEqual([a, b].map((p) => p.slice(root.length + 1)), ['bank', 'bank-2']);
   assert.deepEqual(readdirSync(a).sort(), ['.gitignore', 'CLAUDE.md', 'README.md', 'idea.json', 'vault']);
-  assert.match(readFileSync(join(a, 'README.md'), 'utf8'), new RegExp(`cd "${a}"\\nclaude`));
+  assert.ok(readFileSync(join(a, 'README.md'), 'utf8').includes(`cd "${a}"\nclaude`), 'the README starts Claude in the folder');
   await assert.rejects(writeProject({ root: 'relative', brief, idea, goal: '', lineage: [], lang: 'en', gitInit: false }), /absolute/);
 });

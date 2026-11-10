@@ -5,11 +5,18 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 ## Commands
 
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
-- `npm test` – 50 tests (`node --test`), fake LLM and fake provider servers, no network
+  - Only Host headers naming this server are answered (DNS rebinding). `HOST=0.0.0.0` or `::` adds the address each connection arrived on (`req.socket.localAddress`) and the machine's own name from `os.hostname()`, plain and `.local` (mDNS), on our port.
+  - Behind a port forward or proxy, list the names in `ALLOWED_HOSTS` (comma separated): a bare name is accepted on any port, `name:port` on that port only (a Host without a port matches `name:443`, for a TLS proxy). The Origin of a write must still equal the Host it was sent to.
+- `npm test` – 136 tests (`node --test`), fake LLM and fake provider servers, no network. `test/browser-deleted-board.test.ts` drives two tabs of a local headless Chrome over the DevTools protocol. It skips when no Chrome/Chromium is found (`CHROME_PATH` points at one) or Node is older than 25.
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
 
+- `server/require-node-25.js` – stops an older Node with a clear message. `npm start` and `npm run dev` run it as its own command before the server (`node server/require-node-25.js && node …`), never with `--import`, which Node before 18.18 and 20.0 rejects. That first command is the reliable guard; the import in `index.ts` only helps when the rest still loads. Keep the file plain ES2015 with no `import`/`export`, so any Node can run it.
+- `server/hosts.ts` – the one place for host and address parsing, shared by the Host/Origin guard (`app.ts`) and the private-address guard (`extract.ts`). Don't add a local copy of any of these elsewhere (tests check it):
+  - IPv6 brackets on and off (`bracketed`, `unbracketed`);
+  - the IPv6 parser (`ipv6Groups`) and `unmappedIPv4`, which turns an IPv4-mapped address (dotted or hex) back into IPv4;
+  - `isLoopbackHost`, for `localhost`, `*.localhost`, 127.0.0.0/8 and `::1`.
 - `server/providers.ts` – `provider:model` routing.
   - Ollama uses the native `/api/chat` with `think:false` and `format:schema`.
   - Anthropic uses the official SDK with `output_config.format`.
@@ -20,6 +27,8 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - `server/leads.ts` – the X and research scouts.
 - `server/project.ts` – Claude Code folders.
 - `server/db.ts` – SQLite (`node:sqlite`), plus `report()` and `dashboard()` queries.
+  - Boards and ideas have `AUTOINCREMENT` ids, so a deleted one's id is not handed out again. `openDb` rebuilds an older database once (`addAutoincrement`): foreign keys off, copy, drop, rename, then `foreign_key_check`, all in one transaction. With broken references it rolls back, warns, and that database keeps reusing ids.
+  - The deleted-board and deleted-idea guards stay for that case. Their tests use `test/reused-ids.ts`, a database that reuses ids the old way.
 - `server/app.ts` – HTTP, SSE (`/api/boards/:id/events`) and Markdown exports.
 - `public/js/score.js` and `public/js/evolve.js` – pure modules shared by the server, browser and tests.
 - `public/js/graph.js` – the canvas.
@@ -33,6 +42,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - **Anthropic native: send no `temperature`.** API version 2026-10-21 rejects it. Use effort `low`. The SDK sends the key as a Bearer token.
 - **OpenRouter: send `reasoning:{enabled:false}`** and retry without it on a 400 that mentions reasoning (some models insist on reasoning).
 - **X scout:** a lead is kept only if its URL is in the search engine's `url_citation` annotations. Never trust a URL the model wrote. Only OpenRouter (Grok) can search X.
+- **Links from visitors are read only through `fetchPage`** (`extract.ts`): http(s) only, private and local addresses refused on every redirect hop, and each name is resolved once per read (`lookupOnce`): the check and the undici dispatcher's connect lookup share that answer, and the dispatcher refuses private answers too, so DNS rebinding cannot swap the address after the check. Never fetch such a URL with plain `fetch`.
 - **App settings live in the browser's localStorage.** The server holds them in memory, and the SSE `hello` tells the browser to push them again after a restart. Board configuration lives in the DB.
 - **Dollar limits only see providers that report cost** (OpenRouter `usage.cost`, Anthropic via the price table). A limit of 0 means free models only.
 - **Text goes into the DOM as text nodes, never `innerHTML`** (`dom.js`). Ideas are written by models and by visitors.

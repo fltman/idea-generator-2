@@ -5,7 +5,7 @@ import { createServer, type Server } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDb } from '../server/db.ts';
+import { openDbReusingIds } from './reused-ids.ts';
 import { createEngine } from '../server/engine.ts';
 import { createAutopilot } from '../server/autopilot.ts';
 import { createHandler } from '../server/app.ts';
@@ -16,10 +16,12 @@ let judgeScores = { originality: 3, feasibility: 3, impact: 3 };
 let judgeKeywords = ['Public Space', 'sound'];
 let failNext: Error | null = null;
 let xCitations: string[] = [];
+let holdChat: Promise<void> | null = null; // while set, every model call waits for it
 
 // Fake chat: answers by schema name, records every request.
 async function fakeChat(r: ChatRequest) {
   calls.push(r);
+  if (holdChat) await holdChat;
   if (failNext) {
     const e = failNext;
     failNext = null;
@@ -50,8 +52,11 @@ let settings: AppSettings = { ...structuredClone(DEFAULT_APP_SETTINGS), projects
 let received = false;
 const runtime = { get: () => settings, set: (s: AppSettings) => { settings = s; received = true; }, received: () => received };
 
-const repo = openDb(':memory:');
+// Ids are reused, as on a database whose AUTOINCREMENT rebuild was rolled back: the delete tests
+// below check that nothing reaches the next board with the same id.
+const repo = openDbReusingIds();
 const revealed: string[] = [];
+let revealFails = false;
 const pages: Record<string, { title: string; text: string }> = {
   'https://example.com/artikel': { title: 'Artikel', text: 'Lång artikeltext om lånecyklar. '.repeat(10) },
   'https://example.com/tom': { title: '', text: 'kort' },
@@ -66,7 +71,10 @@ const engine = createEngine({
     { id: '2610.1', title: 'Spatial audio', summary: 'sum', published: '2026-10-30', upvotes: 9 },
     { id: '2610.2', title: 'Other', summary: 'sum', published: '2026-10-29', upvotes: 1 },
   ],
-  reveal: (p) => revealed.push(p),
+  reveal: async (p) => {
+    if (revealFails) throw new Error('Cannot show the folder: xdg-open is not installed on the server');
+    revealed.push(p);
+  },
 });
 const autopilot = createAutopilot({ repo, engine, settings: () => settings });
 let server: Server;
@@ -191,6 +199,12 @@ test('the judge turns gold into a Claude Code project; a board can switch that o
   assert.equal(again.data.existed, true, 'one project per idea');
   await api('POST', `/api/ideas/${s.id}/reveal`, {});
   assert.deepEqual(revealed, [gold.projectPath]);
+  revealFails = true;
+  const failed = await api('POST', `/api/ideas/${s.id}/reveal`, {});
+  revealFails = false;
+  assert.equal(failed.status, 500, 'a reveal that did not open is not ok');
+  assert.equal(failed.data.code, 'reveal_failed');
+  assert.match(failed.data.error, /xdg-open is not installed/);
 
   const off = await newBoard();
   await api('PATCH', `/api/boards/${off.id}`, { config: { autoProjectOnGold: false } });
@@ -297,9 +311,42 @@ test('dashboard: keyword trends across boards, and drill-down', async () => {
   assert.equal(kw.recent, 2);
   assert.equal(kw.series.length, 7);
   assert.equal(kw.series.at(-1), 2, 'today');
+  // A fractional period rounds to whole days and still ends today.
+  const { data: half } = await api('GET', '/api/dashboard?days=1.5');
+  const kwHalf = half.keywords.find((k: any) => k.keyword === 'trend keyword');
+  assert.equal(kwHalf.series.length, 2);
+  assert.equal(kwHalf.series.at(-1), 2, 'today is in a fractional period');
+  const { data: report } = await api('GET', '/api/report?days=2.5');
+  assert.equal(report.days, 3);
+  assert.ok(report.totals.newIdeas >= 2, "today's ideas count as new");
   const { data: drill } = await api('GET', `/api/keywords/${encodeURIComponent('trend keyword')}/ideas`);
   assert.deepEqual(drill.ideas.map((i: any) => i.boardTitle).sort(), ['D1', 'D2']);
   judgeKeywords = ['public space', 'sound'];
+});
+
+test('DELETE /api/boards/:id: an expand still waiting on the model ends with board_deleted, not in the board that reuses the id', async () => {
+  await engine.idle();
+  const gone = await newBoard({ title: 'Raderas' });
+  const parent = await seed(gone.id, 'Förälder');
+  await engine.idle();
+
+  let release!: () => void;
+  holdChat = new Promise<void>((r) => (release = r));
+  const expanding = api('POST', `/api/ideas/${parent.id}/expand`, {});
+  await new Promise((r) => setTimeout(r, 20)); // the expand waits on the model
+
+  assert.equal((await api('DELETE', `/api/boards/${gone.id}`)).status, 200);
+  const next = await newBoard({ title: 'Ny' });
+  assert.equal(next.id, gone.id, 'the new board gets the deleted board\'s id');
+
+  holdChat = null;
+  release();
+  const r = await expanding;
+  assert.equal(r.status, 409);
+  assert.equal(r.data.code, 'board_deleted');
+  await engine.idle();
+  const { data } = await api('GET', `/api/boards/${next.id}`);
+  assert.deepEqual(data.ideas, [], 'nothing from the old board\'s expand');
 });
 
 test('live events: a browser following a board sees what happens', async () => {
@@ -331,6 +378,39 @@ test('live events: a browser following a board sees what happens', async () => {
   const types = seen.map((e) => e.type);
   assert.equal(types[0], 'hello');
   assert.ok(types.includes('ideas') && types.includes('judging'), types.join(','));
+});
+
+test('live events: a page open on a deleted board hears "deleted", then its stream ends', async () => {
+  const board = await newBoard();
+  const res = await fetch(`${base}/api/boards/${board.id}/events`);
+  const reader = res.body!.getReader();
+  const seen: any[] = [];
+  const dec = new TextDecoder();
+  const pump = (async () => {
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return 'ended';
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        if (chunk.startsWith('data: ')) seen.push(JSON.parse(chunk.slice(6)));
+      }
+    }
+  })();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal((await api('DELETE', `/api/boards/${board.id}`)).status, 200);
+  const timeout = new Promise((r) => setTimeout(() => r('still open'), 2000));
+  assert.equal(await Promise.race([pump, timeout]), 'ended', 'the server ends the stream');
+  assert.deepEqual(seen.map((e) => e.type), ['hello', 'deleted']);
+  assert.equal(seen[1].boardId, board.id);
+  const next = await newBoard();
+  assert.equal(next.id, board.id, 'the next board gets the id');
+  await seed(next.id, 'Ny');
+  await engine.idle();
+  assert.deepEqual(seen.map((e) => e.type), ['hello', 'deleted'], 'nothing of the new board reached the old page');
 });
 
 test('provider failures surface with their code, and nothing is half-saved', async () => {

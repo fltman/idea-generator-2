@@ -5,7 +5,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve, sep } from 'node:path';
-import type { Repo, Idea, Board } from './db.ts';
+import { isIP } from 'node:net';
+import { hostname as osHostname } from 'node:os';
+import { wholeDays, type Repo, type Idea, type Board } from './db.ts';
+import { bracketed, isLoopbackHost, unbracketed, unmappedIPv4 } from './hosts.ts';
 import { AppError, type Engine } from './engine.ts';
 import type { Autopilot } from './autopilot.ts';
 import { PROVIDERS, keySource, listModels, mergeAppSettings, type AppSettings, type ProviderId } from './providers.ts';
@@ -18,7 +21,16 @@ export type Runtime = {
   received(): boolean;
 };
 
-type Deps = { repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string };
+type Deps = {
+  repo: Repo; engine: Engine; autopilot: Autopilot; runtime: Runtime; publicDir: string;
+  /**
+   * The HOST the server was started with, accepted as a Host header besides the
+   * loopback names. A wildcard bind (0.0.0.0, ::) accepts the address each connection arrived on.
+   */
+  host?: string;
+  /** ALLOWED_HOSTS: names accepted on any port (behind a port forward or proxy), or name:port for one port. */
+  allowedHostList?: string;
+};
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -32,8 +44,17 @@ const TYPES: Record<string, string> = {
 };
 
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
-const daysOf = (url: URL) => Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 30));
+// Whole days only: localDays() steps back k days with new Date(y, m, d - k), and a
+// fractional k would truncate to yesterday and leave today out of the period.
+const clampDays = (v: unknown) => Math.min(365, wholeDays(Number(v) || 30)); // the same rounding as db.ts
+const daysOf = (url: URL) => clampDays(url.searchParams.get('days'));
 
+/**
+ * The body of a matched route, as JSON. A body must be sent as application/json (see
+ * guardMutation); an empty one needs no Content-Type, so a script's
+ * `curl -X POST .../judge` works, and so does a client that sends an empty chunked
+ * body. This runs after routing, so a misspelled route answers 404, not 415.
+ */
 async function readJson(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -43,12 +64,250 @@ async function readJson(req: IncomingMessage): Promise<any> {
     chunks.push(c);
   }
   if (!size) return {};
+  if (!/^application\/json\b/i.test(req.headers['content-type'] ?? ''))
+    throw new AppError(415, 'bad_content_type', 'Send the body as application/json');
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
     throw new AppError(400, 'bad_json', 'Invalid JSON');
   }
 }
+
+/**
+ * Host header values this server answers to, on the port a request came in on.
+ * DNS rebinding points an attacker's name at 127.0.0.1: the browser then treats
+ * the attacker's page and this server as one origin, sends Host: evil.example,
+ * and can read every answer. Refusing any Host but our own names closes that.
+ */
+export function allowedHosts(port: number, host?: string) {
+  const names = ['localhost', '127.0.0.1', '[::1]'];
+  const extra = host?.trim();
+  if (extra && !isWildcard(extra)) names.push(bracketed(extra)); // a wildcard is a bind, not a name: see hostGuard
+  const out = new Set<string>();
+  for (const n of names) {
+    const key = hostKey(`${n}:${port}`);
+    if (key) out.add(key);
+  }
+  return out;
+}
+
+/**
+ * The one form both guards compare: "hostname:port", lowercased, IPv6 in brackets
+ * and compressed, the port always written (80 or 443 when the sender left it out).
+ * The URL parser does the work, so LOCALHOST:80, localhost and localhost:80 agree.
+ */
+const keyOf = (u: URL) => `${u.hostname}:${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
+
+/** A Host header in normal form, or null if it is not a bare host[:port]. */
+export function hostKey(header: string | undefined): string | null {
+  if (!header) return null;
+  try {
+    const u = new URL(`http://${header}`);
+    if (u.username || u.password || u.pathname !== '/' || u.search || u.hash || u.host === '') return null;
+    return keyOf(u);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every key a Host header can stand for. A header that names a port means that port
+ * only. One without a port means 80 to a plain browser request, but a TLS proxy that
+ * forwards Host as is (nginx: proxy_set_header Host $host) also sends it without a
+ * port for https on 443, so a portless Host stands for both name:80 and name:443.
+ * One URL parse gives the key; whether the header names a port is read off the text,
+ * since the parser folds "name" and "name:80" into the same host. Called once per
+ * request, by the handler, for both guards.
+ */
+export function hostKeys(header: string | undefined): string[] {
+  const key = hostKey(header);
+  if (!key) return [];
+  return namesPort(header!) ? [key] : [key, `${hostnameOfKey(key)}:443`];
+}
+
+/**
+ * Does a Host header that hostKey accepted write a port (":80", ":080", ":8300")?
+ * Read on the part the URL parser takes as host[:port]: it drops every tab and
+ * newline and trailing controls and spaces, skips any / or \ right after "http://",
+ * and stops the authority at the next / ? # or \ ("name:80/" and "name:80?" are
+ * name:80 too). An empty port ("name:") names none.
+ */
+function namesPort(header: string): boolean {
+  const authority = header.replace(/[\t\n\r]/g, '').replace(/[\x00-\x20]+$/, '').replace(/^[/\\]+/, '').split(/[/?#\\]/)[0];
+  return /:\d+$/.test(authority);
+}
+
+/** An Origin header in normal form, or null for "null", other schemes and junk. */
+export function originKey(origin: string | undefined): string | null {
+  if (!origin) return null;
+  try {
+    const u = new URL(origin);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? keyOf(u) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 0.0.0.0, ::, [::] and other spellings of "every address": a bind, not a name anyone browses to. */
+export function isWildcard(host: string) {
+  const bare = unbracketed(host);
+  return isIP(bare) !== 0 && /^[0:.]+$/.test(bare);
+}
+
+/**
+ * The Host a browser sends when it reached us at local address `address` on `port`,
+ * in hostKey form: an IPv4-mapped address (::ffff:192.168.1.20, what a dual-stack
+ * socket reports for IPv4) back to IPv4, no IPv6 zone id (a URL cannot carry one),
+ * IPv6 in brackets. Null for anything that is not a usable address.
+ */
+export function arrivalKey(address: string | undefined, port: number): string | null {
+  if (!address) return null;
+  const ip = unmappedIPv4(address) ?? address.split('%')[0];
+  if (!isIP(ip) || isWildcard(ip)) return null;
+  return hostKey(`${bracketed(ip)}:${port}`);
+}
+
+const hostnameOfKey = (key: string) => key.slice(0, key.lastIndexOf(':'));
+
+/**
+ * ALLOWED_HOSTS, comma or space separated. A bare name (localhost, ideas.example.com,
+ * 192.168.1.20, ::1) is accepted on any port, for a port forward or a proxy whose
+ * public port is not ours; name:port is accepted on that port only. A malformed
+ * entry stops the server at start-up rather than silently refusing every request.
+ */
+export function parseAllowedHosts(list: string | undefined) {
+  const names = new Set<string>();
+  const keys = new Set<string>();
+  for (const raw of (list ?? '').split(/[\s,]+/).filter(Boolean)) {
+    const entry = bracketed(raw);
+    const key = hostKey(entry);
+    if (!key) throw new Error(`ALLOWED_HOSTS: "${raw}" is not a host name`);
+    if (/:\d+$/.test(entry)) keys.add(key);
+    else names.add(hostnameOfKey(key));
+  }
+  return { names, keys };
+}
+
+/**
+ * Decides whether a host (in hostKey form) is ours, for a request that came in on
+ * `port` at local address `arrivedAt`. The loopback and HOST names are built once
+ * per port. A wildcard bind has no address of its own, so there the address the
+ * connection arrived on is ours: a tablet that opened http://192.168.1.20:8300
+ * reached us at 192.168.1.20, whichever interface that is and however recently it
+ * came up. A rebinding page cannot use this: its Host is its own name, never our address.
+ */
+export function hostGuard(opts: { host?: string; allowedHostList?: string; hostname?: () => string } = {}) {
+  const extra = parseAllowedHosts(opts.allowedHostList);
+  const wildcard = !!opts.host && isWildcard(opts.host);
+  const hostname = opts.hostname ?? osHostname;
+  const cache = new Map<number, Set<string>>();
+  // The machine's names as keys on each port, for the hostname() they were built from.
+  const machine = new Map<number, { from: string; keys: Set<string> }>();
+  return (port: number, sent: string, arrivedAt?: string): boolean => {
+    if (extra.keys.has(sent) || extra.names.has(hostnameOfKey(sent))) return true;
+    let names = cache.get(port);
+    if (!names) cache.set(port, (names = allowedHosts(port, opts.host)));
+    if (names.has(sent)) return true;
+    if (!wildcard) return false;
+    // The arrival address and the machine's names count on our port only: a Host on
+    // any other port is refused here, before any parsing or a call to hostname().
+    if (!sent.endsWith(`:${port}`)) return false;
+    if (sent === arrivalKey(arrivedAt, port)) return true;
+    // The machine's own names, read now (a rename needs no restart). Their keys are
+    // rebuilt only when the name changes, so a stream of refused Hosts (scanners,
+    // rebinding attempts) costs one hostname() and a set lookup each.
+    const from = hostname();
+    let known = machine.get(port);
+    if (!known || known.from !== from) {
+      const keys = machineNames(from).map((name) => hostKey(`${name}:${port}`)).filter((key): key is string => key !== null);
+      machine.set(port, (known = { from, keys: new Set(keys) }));
+    }
+    return known.keys.has(sent);
+  };
+}
+
+/**
+ * The names other machines on the network use for this one, from os.hostname():
+ * the name itself, its first label, and that label's mDNS name (label.local).
+ * "Studio-PC" gives studio-pc and studio-pc.local; "studio.local" gives studio.local
+ * and studio; "box.example.com" also gives box and box.local. An address or an
+ * empty name gives nothing: addresses are handled by the arrival address.
+ */
+export function machineNames(hostname: string): string[] {
+  const full = hostname.trim().toLowerCase().replace(/\.$/, '');
+  if (!full || isIP(unbracketed(full)) !== 0) return [];
+  const label = full.split('.')[0];
+  if (!label) return [];
+  return [...new Set([full, label, `${label}.local`])];
+}
+
+/** What to do about a reverse proxy, for the 403 and the start-up log. */
+export const PROXY_HINT =
+  "Behind a reverse proxy, have it pass the browser's Host on (nginx: proxy_set_header Host $host;) and list the public name in ALLOWED_HOSTS.";
+
+/**
+ * Why a write was refused. A proxy that rewrites Host to its upstream (nginx's
+ * default proxy_pass sends Host: 127.0.0.1:8300) passes the Host guard, since that
+ * is a loopback name, but every write from the public page then fails here. When the
+ * Host is loopback and the Origin is not, say so and say what to change. No other
+ * case gets the hint: a page from another local server (http://localhost:5173) is
+ * simply not this app.
+ */
+export function badOriginMessage(origin: string, from: string | null, host: string | undefined, sent: string | null) {
+  const base = `Requests from ${origin} are not accepted`;
+  if (!from || !sent || !isLoopbackHost(hostnameOfKey(sent)) || isLoopbackHost(hostnameOfKey(from))) return base;
+  return `${base}: they reached the server with Host ${host}, a loopback name, so a reverse proxy probably rewrote it. ` +
+    `Have the proxy pass the browser's Host on (nginx: proxy_set_header Host $host;) and list ${hostnameOfKey(from)} in ALLOWED_HOSTS.`;
+}
+
+/**
+ * The start-up note on Host names. A proxy cannot be detected at start-up, so the
+ * note says what a proxy needs whenever one could matter: always, worded for
+ * whether ALLOWED_HOSTS is set yet.
+ */
+export function hostNote(allowedHostList: string | undefined): string {
+  const { names, keys } = parseAllowedHosts(allowedHostList);
+  const listed = [...names, ...keys];
+  if (!listed.length) return PROXY_HINT;
+  return `Also answering to ALLOWED_HOSTS: ${listed.join(', ')}. A reverse proxy must pass the browser's Host on ` +
+    '(nginx: proxy_set_header Host $host;), or writes from the browser are refused (403 bad_origin).';
+}
+
+/** `sent` is hostKeys(Host), computed once per request by the handler. */
+function guardHost(req: IncomingMessage, sent: string[], isOurs: (port: number, sent: string, arrivedAt?: string) => boolean) {
+  const port = req.socket.localPort;
+  const arrivedAt = req.socket.localAddress;
+  // A portless Host also matches an ALLOWED_HOSTS name:443.
+  if (!port || !sent.some((key) => isOurs(port, key, arrivedAt))) throw new AppError(403, 'bad_host', `Unknown host ${req.headers.host ?? '(none)'}`);
+}
+
+/**
+ * Only the app's own page may change state. A page on another site can make the
+ * browser POST here (loopback is no protection against the user's own browser),
+ * and could repoint a provider URL to itself to collect the API keys, or move the
+ * projects folder. Browsers send Origin on every request that is not GET/HEAD,
+ * so an Origin other than the host this request was sent to is refused; a request
+ * without Origin comes from a non-browser client such as a shell script or the tests.
+ * Bodies must be JSON: a cross-site form or fetch can only send text/plain without a
+ * CORS preflight. readJson checks that once a route has matched; a request with no
+ * body needs no Content-Type.
+ *
+ * The Origin must be the Host header itself, not just any of our names: a bare
+ * ALLOWED_HOSTS name is ours on every port, and a page from another local server
+ * (http://localhost:5173) must not count as this app. The one widening is a Host
+ * without a port, which an https page behind a TLS proxy also arrives with, so its
+ * Origin may be https://name as well as http://name (see hostKeys).
+ */
+function guardMutation(req: IncomingMessage, sent: string[]) {
+  const method = req.method ?? 'GET';
+  if (method === 'GET' || method === 'HEAD') return;
+  const origin = req.headers.origin;
+  if (origin !== undefined) {
+    const from = originKey(origin); // null for "null" or junk: not us
+    if (!from || !sent.includes(from)) throw new AppError(403, 'bad_origin', badOriginMessage(origin, from, req.headers.host, sent[0] ?? null));
+  }
+}
+
 
 function send(res: ServerResponse, status: number, body: unknown, type = 'application/json; charset=utf-8') {
   const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
@@ -162,8 +421,9 @@ export function reportMarkdown(r: ReturnType<Repo['report']>, lang: 'sv' | 'en')
   return out.join('\n');
 }
 
-export function createHandler({ repo, engine, autopilot, runtime, publicDir }: Deps) {
+export function createHandler({ repo, engine, autopilot, runtime, publicDir, host, allowedHostList }: Deps) {
   const root = resolve(publicDir);
+  const isOurs = hostGuard({ host, allowedHostList });
 
   function providerStatus() {
     const s = runtime.get();
@@ -228,9 +488,14 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
       if (typeof b.title === 'string' && b.title.trim()) patch.title = str(b.title, 120);
       if (typeof b.goal === 'string') patch.goal = str(b.goal, 600);
       if (b.config && typeof b.config === 'object') patch.config = b.config;
-      return engine.updateBoard(+id, patch);
+      const out = engine.updateBoard(+id, patch);
+      autopilot.modeChanged(+id, out.board.config.mode); // a step still running ends as manual at once
+      return out;
     }],
-    ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => ({ ok: repo.deleteBoard(+id) })],
+    ['DELETE', /^\/api\/boards\/(\d+)$/, ([id]) => {
+      autopilot.forget(+id); // before the id can be handed to a new board
+      return { ok: engine.deleteBoard(+id) }; // and model calls still running for it drop their results
+    }],
     ['PUT', /^\/api\/boards\/(\d+)\/positions$/, ([id], b) => {
       if (!repo.getBoard(+id)) throw new AppError(404, 'not_found', 'Board not found');
       const positions = (Array.isArray(b.positions) ? b.positions : [])
@@ -268,12 +533,12 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
     ['DELETE', /^\/api\/leads\/(\d+)$/, ([id]) => ({ ok: repo.deleteLead(+id) })],
 
     // ---- dashboard: keyword trends across all boards
-    ['GET', /^\/api\/dashboard$/, (_p, _b, url) => repo.dashboard(Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 30)))],
+    ['GET', /^\/api\/dashboard$/, (_p, _b, url) => repo.dashboard(daysOf(url))],
     ['GET', /^\/api\/keywords\/([^/]+)\/ideas$/, ([kw]) => ({ ideas: repo.ideasWithKeyword(decodeURIComponent(kw)) })],
 
     // ---- report: insights, ideas and projects across all boards
     ['GET', /^\/api\/report$/, (_p, _b, url) => repo.report(daysOf(url))],
-    ['POST', /^\/api\/report\/synthesis$/, (_p, b) => engine.synthesize(Math.min(365, Math.max(1, Number(b.days) || 30)), b.lang === 'en' ? 'en' : 'sv')],
+    ['POST', /^\/api\/report\/synthesis$/, (_p, b) => engine.synthesize(clampDays(b.days), b.lang === 'en' ? 'en' : 'sv')],
     ['GET', /^\/api\/report\.md$/, (_p, _b, url) => ({
       __raw: reportMarkdown(repo.report(daysOf(url)), url.searchParams.get('lang') === 'en' ? 'en' : 'sv'),
       type: 'text/markdown; charset=utf-8',
@@ -299,14 +564,19 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   function events(boardId: number, req: IncomingMessage, res: ServerResponse) {
     if (!repo.getBoard(boardId)) return send(res, 404, { error: 'Board not found' });
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-    const write = (e: unknown) => res.write(`data: ${JSON.stringify(e)}\n\n`);
+    const write = (e: any) => {
+      res.write(`data: ${JSON.stringify(e)}\n\n`);
+      if (e?.type === 'deleted') stop(); // the bus has dropped us; end the stream too (the page closes its EventSource)
+    };
     write({ type: 'hello', autopilot: autopilot.status(boardId), settingsReceived: runtime.received() });
     const off = engine.bus.on(boardId, write);
     const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
-    req.on('close', () => {
+    function stop() {
       off();
       clearInterval(ping);
-    });
+      res.end();
+    }
+    req.on('close', stop);
   }
 
   async function serveStatic(pathname: string, res: ServerResponse) {
@@ -324,10 +594,13 @@ export function createHandler({ repo, engine, autopilot, runtime, publicDir }: D
   return async function handler(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? '/', 'http://localhost');
     try {
+      const sent = hostKeys(req.headers.host); // one parse of Host, for both guards
+      guardHost(req, sent, isOurs); // every request, reads too: a rebound page could read boards and settings
       if (!url.pathname.startsWith('/api/')) {
         if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, { error: 'Method not allowed' });
         return await serveStatic(url.pathname, res);
       }
+      guardMutation(req, sent);
       const ev = url.pathname.match(/^\/api\/boards\/(\d+)\/events$/);
       if (ev && req.method === 'GET') return events(+ev[1], req, res);
       for (const [method, re, fn] of routes) {

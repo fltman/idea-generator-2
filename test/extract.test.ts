@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { asUrl, decodeEntities, htmlToText } from '../server/extract.ts';
+import { asUrl, createDispatcher, decodeEntities, embeddedIPv4, fetchPage, guardedLookup, htmlToText, isPrivateAddress, lookupOnce } from '../server/extract.ts';
+import { createServer, type Server } from 'node:http';
+import { fetch as undiciFetch } from 'undici';
 
 test('recognises a lone link, with or without scheme', () => {
   assert.equal(asUrl('https://example.com/a?b=1'), 'https://example.com/a?b=1');
@@ -42,4 +44,278 @@ test('caps very long pages', () => {
   const { text } = htmlToText(`<body><p>${'ord '.repeat(5000)}</p></body>`);
   assert.ok(text.length <= 6000 + 4);
   assert.ok(text.endsWith('[…]'));
+});
+
+test('NAT64 and 6to4 addresses are judged by the IPv4 they embed, so DNS64 networks still reach the web', () => {
+  for (const [a, v4] of [['64:ff9b::808:808', '8.8.8.8'], ['64:ff9b::8.8.8.8', '8.8.8.8'], ['64:ff9b::a9fe:a9fe', '169.254.169.254'],
+                         ['2002:808:808::1', '8.8.8.8'], ['2002:c0a8:101:5::9', '192.168.1.1'], ['2003::1', null], ['8.8.8.8', null]] as const)
+    assert.equal(embeddedIPv4(a), v4, a);
+  for (const a of ['64:ff9b::808:808', '64:ff9b::5db8:d822', '64:ff9b::8.8.8.8', '2002:808:808::1', '2002:5db8:d822:1::1'])
+    assert.ok(!isPrivateAddress(a), `${a} is public`);
+  for (const a of ['64:ff9b::a9fe:a9fe', '64:ff9b::7f00:1', '64:ff9b::10.0.0.1', '64:ff9b::c000:201', '2002:c0a8:101::1', '2002:7f00:1::1', '2002::1', '64:ff9b:1::808:808'])
+    assert.ok(isPrivateAddress(a), `${a} is private`);
+});
+
+test('links to this machine, the LAN and link-local are refused, also after a redirect', async () => {
+  for (const a of ['127.0.0.1', '127.8.8.8', '10.0.0.5', '172.31.9.9', '192.168.1.1', '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', '::', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', 'not-an-ip',
+                   '64:ff9b::a9fe:a9fe', '::a9fe:a9fe', '::10.0.0.1', '::127.0.0.1', 'fec0::1', 'feff::1', '2002:c0a8:101::1',
+                   '64:ff9b:1::a9fe:a9fe', '64:ff9b:1:ffff::1', '::ffff:0:a9fe:a9fe', '::ffff:0:7f00:1', '::ffff:7f00:1', '::ffff:a9fe:a9fe',
+                   '2001:0:4136:e378:8000:63bf:3fff:fdd2', '2001::1', '2001:0:ffff:ffff:ffff:ffff:ffff:ffff', '2001:db8::1', '2001:db8:ffff::1',
+                   '192.0.2.1', '198.51.100.7', '203.0.113.9', '192.88.99.1'])
+    assert.ok(isPrivateAddress(a), `${a} is private`);
+  for (const a of ['93.184.216.34', '8.8.8.8', '172.32.0.1', '2606:2800:220:1:248:1893:25c8:1946', '::ffff:8.8.8.8',
+                   '2001:4860:4860::8888', '64:ff9b::808:808', '2002:808:808::1', '64:ff9c::1', '2003::1', '::1:0:0:1', '64:ff9b:2::1', '::ffff:1:0:1', '::ffff:808:808',
+                   '2001:1::1:0:0:1', '2001:4860::1', '2001:db7:ffff::1', '2001:db9::1', '192.0.3.1', '198.51.101.1', '203.0.114.1', '192.88.100.1'])
+    assert.ok(!isPrivateAddress(a), `${a} is public`);
+
+  // Names resolve through an injected lookup: no network in the tests.
+  const dns: Record<string, string[]> = {
+    'example.com': ['93.184.216.34'], 'www.example.com': ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'],
+    'rebind.example': ['93.184.216.34', '10.0.0.5'], 'intranet.example': ['192.168.0.10'],
+  };
+  const lookup = async (h: string) => { if (!dns[h]) throw new Error('ENOTFOUND'); return dns[h]; };
+  const fetched: string[] = [];
+  const page = (title: string) => new Response(`<title>${title}</title><body><p>Text</p></body>`, { status: 200, headers: { 'content-type': 'text/html' } });
+  const fake = (async (u: URL | string | Request) => {
+    const url = String(u);
+    fetched.push(url);
+    if (url === 'https://example.com/go') return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:8300/api/boards' } });
+    if (url === 'https://example.com/hop') return new Response(null, { status: 301, headers: { location: '/landed' } });
+    if (url === 'https://example.com/loop') return new Response(null, { status: 302, headers: { location: '/loop' } });
+    if (url === 'https://example.com/landed') return page('Landed');
+    return page('Direct');
+  }) as typeof fetch;
+  const read = (u: string) => fetchPage(u, { fetch: fake, lookup });
+  const refused = /private or local/;
+
+  for (const u of ['http://127.0.0.1:8300/api/boards', 'http://localhost/', 'http://a.localhost/', 'http://[::1]/', 'http://169.254.169.254/latest/meta-data',
+                   'http://10.1.2.3/', 'http://192.168.1.1/admin', 'http://[fe80::1]/', 'http://intranet.example/', 'http://rebind.example/',
+                   'http://[64:ff9b::a9fe:a9fe]/latest/meta-data', 'http://[::a9fe:a9fe]/', 'http://[fec0::1]/', 'http://[2002:a9fe:a9fe::1]/',
+                   'http://[64:ff9b:1::a9fe:a9fe]/', 'http://[::ffff:0:a9fe:a9fe]/', 'http://[::ffff:127.0.0.1]/', 'http://[::ffff:169.254.169.254]/',
+                   'http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/', 'http://[2001:db8::1]/', 'http://192.0.2.1/', 'http://203.0.113.9/'])
+    await assert.rejects(read(u), refused, u);
+  await assert.rejects(read('ftp://example.com/'), /http/);
+  await assert.rejects(read('https://nowhere.example/'), /resolve/);
+  assert.deepEqual(fetched, [], 'nothing was fetched');
+
+  await assert.rejects(read('https://example.com/go'), refused, 'a redirect to this machine is refused');
+  assert.deepEqual(fetched, ['https://example.com/go'], 'the redirect target was never fetched');
+  fetched.length = 0;
+  assert.equal((await read('https://example.com/hop')).title, 'Landed', 'a public redirect is followed');
+  assert.deepEqual(fetched, ['https://example.com/hop', 'https://example.com/landed']);
+  assert.equal((await read('https://www.example.com/')).title, 'Direct');
+  await assert.rejects(read('https://example.com/loop'), /redirects/);
+});
+
+// ---- fetchPage limits: size, one deadline, and no body left unread.
+const publicDns = async () => ['93.184.216.34'];
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((done, fail) => {
+    const t = setTimeout(done, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(t); fail(signal.reason); }, { once: true });
+  });
+const html = { 'content-type': 'text/html' };
+/** A body that records whether it was cancelled. */
+function tracked(chunks: string[] = []) {
+  const state = { cancelled: false };
+  const enc = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    pull(c) { const next = chunks.shift(); if (next === undefined) c.close(); else c.enqueue(enc.encode(next)); },
+    cancel() { state.cancelled = true; },
+  });
+  return { body, state };
+}
+
+test('an endless page is read up to the size cap and the rest is never downloaded', { timeout: 5000 }, async () => {
+  const chunk = new TextEncoder().encode(`<p>${'ord '.repeat(16_000)}</p>`); // about 64 kB
+  let pulled = 0;
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    pull(c) { pulled += chunk.byteLength; c.enqueue(chunk); },
+    cancel() { cancelled = true; },
+  });
+  const page = await fetchPage('https://example.com/endless', { fetch: (async () => new Response(body, { headers: html })) as typeof fetch, lookup: publicDns });
+  assert.ok(page.text.length > 0 && page.text.length <= 6000 + 4);
+  assert.ok(cancelled, 'the stream was cancelled at the cap');
+  assert.ok(pulled <= 2_000_000 + 2 * chunk.byteLength, `read ${pulled} bytes, about 2 MB at most`);
+});
+
+test('one deadline covers every hop: slow redirects add up', async () => {
+  const fake = (async (u: URL | string | Request, init?: RequestInit) => {
+    await sleep(150, init?.signal ?? undefined); // each hop alone is well inside the deadline
+    const n = Number(String(u).match(/\/(\d+)$/)?.[1] ?? 0);
+    return n < 4 ? new Response(null, { status: 302, headers: { location: `/${n + 1}` } }) : new Response('<p>end</p>', { headers: html });
+  }) as typeof fetch;
+  const t0 = Date.now();
+  await assert.rejects(fetchPage('https://example.com/0', { fetch: fake, lookup: publicDns, timeoutMs: 300 }), /No answer within 0\.3 s/);
+  assert.ok(Date.now() - t0 < 700, 'stopped at the deadline, not after every hop');
+  // The same chain with time to spare goes through.
+  assert.equal((await fetchPage('https://example.com/0', { fetch: fake, lookup: publicDns, timeoutMs: 3000 })).text, 'end');
+});
+
+test('the deadline also bounds DNS and a body that stops sending', async () => {
+  const neverAnswers = () => new Promise<string[]>(() => {});
+  let fetched = false;
+  const t0 = Date.now();
+  await assert.rejects(
+    fetchPage('https://slow-dns.example/', { fetch: (async () => { fetched = true; return new Response(''); }) as typeof fetch, lookup: neverAnswers, timeoutMs: 200 }),
+    /No answer within 0\.2 s/,
+  );
+  assert.ok(Date.now() - t0 < 600);
+  assert.equal(fetched, false);
+
+  let cancelled = false;
+  const stalled = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}), cancel() { cancelled = true; } });
+  await assert.rejects(
+    fetchPage('https://example.com/stall', { fetch: (async () => new Response(stalled, { headers: html })) as typeof fetch, lookup: publicDns, timeoutMs: 200 }),
+    /No answer/,
+  );
+  assert.ok(cancelled, 'the stalled body was cancelled');
+});
+
+test('bodies that are not read are cancelled: every redirect, an error page, a non-page', async () => {
+  const bodies: { cancelled: boolean }[] = [];
+  const fake = (async (u: URL | string | Request) => {
+    const url = String(u);
+    const make = (status: number, headers: Record<string, string>, chunks = ['<p>ignored</p>']) => {
+      const { body, state } = tracked(chunks);
+      bodies.push(state);
+      return new Response(body, { status, headers });
+    };
+    if (url.endsWith('/a')) return make(301, { location: '/b' });
+    if (url.endsWith('/b')) return make(302, { location: '/c' });
+    if (url.endsWith('/c')) return make(200, html, ['<title>C</title><p>Text</p>']);
+    if (url.endsWith('/gone')) return make(404, html);
+    return make(200, { 'content-type': 'application/pdf' });
+  }) as typeof fetch;
+  const read = (u: string) => fetchPage(u, { fetch: fake, lookup: publicDns });
+
+  assert.equal((await read('https://example.com/a')).title, 'C');
+  assert.deepEqual(bodies.map((b) => b.cancelled), [true, true, false], 'both redirect bodies cancelled; the page read to its end');
+  bodies.length = 0;
+  await assert.rejects(read('https://example.com/gone'), /HTTP 404/);
+  await assert.rejects(read('https://example.com/file.pdf'), /Not a web page/);
+  assert.deepEqual(bodies.map((b) => b.cancelled), [true, true]);
+});
+
+// ---- DNS rebinding: the address that is checked is the address that is connected to.
+/** A local HTTP server that counts the requests it gets. */
+async function localServer() {
+  const seen: string[] = [];
+  const server: Server = createServer((req, res) => {
+    seen.push(String(req.headers.host));
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<title>Local</title><p>secret</p>');
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return { seen, port: (server.address() as any).port as number, close: () => new Promise((r) => server.close(r)) };
+}
+
+test('connect lookup: refuses private answers, and answers in both net.connect forms', async () => {
+  const ask = (lookup: (h: string) => Promise<string[]>, options: any) =>
+    new Promise<{ err: Error | null; address: unknown; family?: number }>((done) =>
+      guardedLookup(lookup)('name.example', options, (err, address, family) => done({ err, address, family })));
+  const dns = (...a: string[]) => async () => a;
+
+  const one = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), {});
+  assert.deepEqual([one.err, one.address, one.family], [null, '93.184.216.34', 4]);
+  const all = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), { all: true });
+  assert.deepEqual(all.address, [{ address: '93.184.216.34', family: 4 }, { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 }]);
+  const v6 = await ask(dns('93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'), { family: 6 });
+  assert.equal(v6.address, '2606:2800:220:1:248:1893:25c8:1946');
+
+  for (const answer of [['127.0.0.1'], ['169.254.169.254'], ['93.184.216.34', '10.0.0.1'], ['::1']]) {
+    const r = await ask(dns(...answer), { all: true });
+    assert.match(String(r.err?.message), /private or local address \(name\.example\)/, answer.join(','));
+  }
+  assert.match(String((await ask(dns(), {})).err?.message), /Could not resolve/);
+  assert.match(String((await ask(async () => { throw new Error('ENOTFOUND'); }, {})).err?.message), /ENOTFOUND/);
+});
+
+test('the connection uses the lookup it was given, not a second DNS query of its own', async () => {
+  const local = await localServer();
+  const asked: string[] = [];
+  // A permissive check, so the test can connect to this machine: only the plumbing is under test here.
+  const dispatcher = createDispatcher(async (h) => { asked.push(h); return ['127.0.0.1']; }, () => false);
+  try {
+    const res = await undiciFetch(`http://app.test:${local.port}/`, { dispatcher });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /secret/);
+    assert.deepEqual(asked, ['app.test'], 'app.test is not in any DNS: our lookup answered');
+    assert.deepEqual(local.seen, [`app.test:${local.port}`]);
+  } finally {
+    await dispatcher.destroy();
+    await local.close();
+  }
+});
+
+test('DNS rebinding: the connection goes to the very address that was checked, with no second lookup', async () => {
+  const local = await localServer();
+  // A stand-in for "public": here only 127.0.0.1 (where the test server listens) is
+  // allowed, and 127.0.0.2 is refused. The name answers the allowed address first and
+  // the refused one after: a second lookup would be refused, the first answer is read.
+  let calls = 0;
+  const lookup = async () => (++calls === 1 ? ['127.0.0.1'] : ['127.0.0.2']);
+  const isRefused = (address: string) => address !== '127.0.0.1';
+  try {
+    const page = await fetchPage(`http://flip.example:${local.port}/`, { lookup, isRefused });
+    assert.equal(page.title, 'Local');
+    assert.equal(calls, 1, 'one lookup for the check and the connection');
+    assert.deepEqual(local.seen, [`flip.example:${local.port}`]);
+    // The other way round, a refused first answer stops the read before any connection.
+    calls = 0;
+    const late = async () => (++calls === 1 ? ['127.0.0.2'] : ['127.0.0.1']);
+    await assert.rejects(fetchPage(`http://flip.example:${local.port}/`, { lookup: late, isRefused }), /private or local address \(flip\.example\)/);
+    assert.equal(calls, 1);
+    assert.equal(local.seen.length, 1, 'no second request');
+  } finally {
+    await local.close();
+  }
+});
+
+test('each host is resolved once per read, across redirect hops back and forth', async () => {
+  const seen: string[] = [];
+  const server: Server = createServer((req, res) => {
+    seen.push(`${req.headers.host}${req.url}`);
+    const port = (server.address() as any).port;
+    const go = (to: string) => { res.writeHead(302, { location: to }); res.end(); };
+    if (req.url === '/a') return go(`http://Other.example:${port}/b`);
+    if (req.url === '/b') return go(`http://app.example:${port}/c`);
+    if (req.url === '/c') return go('/d');
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<title>Slut</title><p>framme</p>');
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const port = (server.address() as any).port as number;
+  const asked: string[] = [];
+  const lookup = async (h: string) => { asked.push(h); return ['127.0.0.1']; };
+  try {
+    const page = await fetchPage(`http://app.example:${port}/a`, { lookup, isRefused: (a) => a !== '127.0.0.1' });
+    assert.equal(page.title, 'Slut');
+    assert.deepEqual(seen, [`app.example:${port}/a`, `other.example:${port}/b`, `app.example:${port}/c`, `app.example:${port}/d`]);
+    assert.deepEqual(asked, ['app.example', 'other.example'], 'app.example three hops, one lookup; other.example one');
+    // A new read is a new answer: nothing is kept between reads.
+    await fetchPage(`http://app.example:${port}/d`, { lookup, isRefused: (a) => a !== '127.0.0.1' });
+    assert.deepEqual(asked, ['app.example', 'other.example', 'app.example']);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('lookupOnce: one question per name, the same answer to everyone, failures too', async () => {
+  const asked: string[] = [];
+  let n = 0;
+  const once = lookupOnce(async (h) => {
+    asked.push(h);
+    if (h === 'gone.example') throw new Error('ENOTFOUND');
+    return [`93.184.216.${++n}`];
+  });
+  const [a, b] = await Promise.all([once('site.example'), once('site.example')]);
+  assert.deepEqual(a, ['93.184.216.1']);
+  assert.equal(a, b, 'two callers at once share one answer');
+  assert.deepEqual(await once('SITE.example'), ['93.184.216.1'], 'names are case-insensitive');
+  assert.deepEqual(await once('other.example'), ['93.184.216.2']);
+  await assert.rejects(once('gone.example'), /ENOTFOUND/);
+  await assert.rejects(once('gone.example'), /ENOTFOUND/);
+  assert.deepEqual(asked, ['site.example', 'other.example', 'gone.example']);
 });
