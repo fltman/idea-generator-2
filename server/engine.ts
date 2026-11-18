@@ -10,9 +10,10 @@ import { makeLLM } from './llm.ts';
 import { asUrl, fetchPage as realFetchPage } from './extract.ts';
 import { fetchPapers as realFetchPapers, researchLeads, xLeads } from './leads.ts';
 import { writeBrief, writeProject } from './project.ts';
-import { ProviderError, type AppSettings, type ChatFn, type Role } from './providers.ts';
+import { PROVIDERS, ProviderError, parseModel, type AppSettings, type ChatFn, type Role } from './providers.ts';
 import { fitness, isJudged, medal, scoreSum } from '../public/js/score.js';
 import { nextMove } from '../public/js/evolve.js';
+import { overBudget } from './autopilot.ts';
 
 export class AppError extends Error {
   status: number;
@@ -63,6 +64,21 @@ function besideBoard(ideas: Idea[]) {
   return { x: maxX + 240, y: meanY + (Math.random() - 0.5) * 160 };
 }
 
+/**
+ * Every model call goes through this: refused once today's global limit is spent, manual clicks
+ * included, not only the autopilot. Models on local providers never cost money and always pass,
+ * so a limit of 0 still means "free models only".
+ */
+function withDailyLimit(chat: ChatFn, repo: Repo, settings: () => AppSettings): ChatFn {
+  return async (r) => {
+    const limit = settings().maxUsdPerDay;
+    if (!PROVIDERS[parseModel(r.model).provider].local && overBudget(repo.spentOn(null), limit)) {
+      throw new AppError(429, 'global_budget', `The global limit of $${limit} per day is reached. Raise it in Settings or wait until tomorrow; local models still work.`);
+    }
+    return chat(r);
+  };
+}
+
 type Deps = {
   repo: Repo;
   chat: ChatFn;
@@ -75,6 +91,7 @@ type Deps = {
 
 export function createEngine(deps: Deps) {
   const { repo } = deps;
+  deps = { ...deps, chat: withDailyLimit(deps.chat, repo, deps.settings) };
   const fetchPage = deps.fetchPage ?? realFetchPage;
   const fetchPapers = deps.fetchPapers ?? realFetchPapers;
   const reveal = deps.reveal ?? ((p: string) => execFile('open', [p], () => {}));

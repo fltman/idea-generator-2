@@ -42,9 +42,11 @@ export function backoffMs(errors: number) {
   return errors > 0 ? Math.min(15 * 60_000, 30_000 * 2 ** (errors - 1)) : 0;
 }
 
+/** Has today's spend reached the limit? Nothing spent is never over, so a limit of 0 still allows free models. */
+export const overBudget = (spent: number, limit: number) => spent > 0 && spent >= limit;
+
 /** Pure: may this board take a step now? */
 export function rateCheck(i: RateInput): RateDecision {
-  const overBudget = (spent: number, limit: number) => spent > 0 && spent >= limit;
   if (overBudget(i.globalSpent, i.globalUsdPerDay)) return { ok: false, reason: 'global_budget', until: nextLocalMidnight(i.now) };
   if (overBudget(i.boardSpent, i.boardUsdPerDay)) return { ok: false, reason: 'board_budget', until: nextLocalMidnight(i.now) };
   if (i.errors > 0 && i.now < i.lastErrorAt + backoffMs(i.errors)) {

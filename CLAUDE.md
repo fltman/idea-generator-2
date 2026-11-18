@@ -5,7 +5,7 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 ## Commands
 
 - `npm start` – server on http://localhost:8300 (`PORT`, `HOST`, `DB_FILE` override)
-- `npm test` – 50 tests (`node --test`), fake LLM and fake provider servers, no network
+- `npm test` – 53 tests (`node --test`), fake LLM and fake provider servers, no network
 - `npm run calibrate [-- --model provider:model]` – real judge against weak and strong reference ideas. It costs money. **Re-run it whenever the judge's prompt, schema or model changes.**
 
 ## Layout
@@ -35,7 +35,9 @@ Node 25 runs the TypeScript server directly; the frontend is vanilla ES modules.
 - **X scout:** a lead is kept only if its URL is in the search engine's `url_citation` annotations. Never trust a URL the model wrote. Only OpenRouter (Grok) can search X.
 - **App settings live in the browser's localStorage.** The server holds them in memory, and the SSE `hello` tells the browser to push them again after a restart. Board configuration lives in the DB.
 - **Dollar limits only see providers that report cost** (OpenRouter `usage.cost`, Anthropic via the price table). A limit of 0 means free models only.
+- **The daily dollar limit (`maxUsdPerDay`) applies to every model call** (the `chat` wrapper in `engine.ts`), manual ones included, not only the autopilot. Local providers (Ollama, MLX, LM Studio) always pass, so 0 still means free models only. It is checked, not reserved: calls already in flight can overshoot it a little.
 - **Text goes into the DOM as text nodes, never `innerHTML`** (`dom.js`). Ideas are written by models and by visitors.
+- **A project's `CLAUDE.md` is fixed text** (`renderClaudeMd()` in `project.ts`). Claude Code loads it as trusted instructions, so nothing a model or a visitor wrote may go in, not even the slug. Ideas, goals, briefs and lineage go to `BRIEF.md`, which `CLAUDE.md` labels as untrusted.
 - **Project folders never overwrite.** They are created with a non-recursive `mkdir`, and a taken name gets `-2`.
 
 ## Measured
